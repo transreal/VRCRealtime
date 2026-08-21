@@ -1,0 +1,20 @@
+{
+	"packageName": "VRCRealtime",
+	"files": [
+		"VRCRealtime.wl"
+	],
+	"directories": [
+		"VRCRealtime_info"
+	],
+	"excludePatterns": [
+		"VRCRealtime_info/history/",
+		"VRCRealtime_info/references/",
+		"VRCRealtime_info/resources/python/__pycache__/",
+		"VRCRealtime_info/resources/tts/",
+		"VRCRealtime_info/resources/tts/models/",
+		"VRCRealtime_info/resources/tts/runtime/",
+		"VRCRealtime_info/resources/models/",
+		"VRCRealtime_info/resources/voices/",
+		"VRCRealtime_info/resources/asr/models/"
+	]
+}
