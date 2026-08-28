@@ -2,8 +2,9 @@
 
 This process deliberately has no OpenAI credential.  It is the only process
 that receives SourceVault text whose privacy level may be 0.5 or higher.  Such
-text is converted to a WAV file by a persistent local Piper Plus process; only
-the WAV path and routing metadata are returned to the Realtime worker.
+text is converted to a WAV file by a local engine -- a persistent Piper Plus
+process, or the AivisSpeech Engine over loopback HTTP -- and only the WAV path
+and routing metadata are returned to the Realtime worker.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 import wave
 from dataclasses import dataclass
@@ -40,7 +43,49 @@ def _protocol_write(payload: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-class PiperSession:
+class _BoundedSynthesis:
+    """Shared "keep a readout under N seconds" logic.
+
+    Subclasses provide synthesize(text, prefix=...) -> Path; the cut is
+    measured from the first pass, not guessed (see synthesize_bounded).
+    """
+
+    _SENTENCE_ENDS = "。．.!?！？\n"
+
+    def synthesize_bounded(
+        self, text: str, max_seconds: float, *, prefix: str = "private"
+    ) -> tuple[Path, bool]:
+        """Synthesize *text*, kept under *max_seconds* of speech.
+
+        The cut is measured, not guessed: the first pass gives the actual
+        characters-per-second of this voice at this length scale, and the text
+        is trimmed to fit from that.  A search hit can be thousands of
+        characters, and a local readout nobody can interrupt is a bad way to
+        spend five minutes of a conversation.
+        """
+
+        path = self.synthesize(text, prefix=prefix)
+        duration = _wav_seconds(path)
+        if max_seconds <= 0.0 or duration <= max_seconds or duration <= 0.0:
+            return path, False
+        per_second = max(1.0, len(text) / duration)
+        # 8% margin: the trimmed text is not spoken at exactly the same rate.
+        keep = max(40, int(max_seconds * per_second * 0.92))
+        if keep >= len(text):
+            return path, False
+        head = text[:keep]
+        cut = max(head.rfind(ch) for ch in self._SENTENCE_ENDS)
+        if cut >= 40:
+            head = head[: cut + 1]
+        head += "以下は長いため省略しました。"
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return self.synthesize(head, prefix=prefix), True
+
+
+class PiperSession(_BoundedSynthesis):
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.audio_dir = Path(args.audio_dir).resolve()
@@ -49,6 +94,8 @@ class PiperSession:
         self.lock = threading.Lock()
 
     def start(self) -> None:
+        if not self.args.piper_executable or not self.args.piper_model:
+            raise RuntimeError("piper unavailable")
         if self.process is not None and self.process.poll() is None:
             return
         env = dict(os.environ)
@@ -114,40 +161,6 @@ class PiperSession:
             raise RuntimeError("local synthesis failed")
         return target
 
-    _SENTENCE_ENDS = "。．.!?！？\n"
-
-    def synthesize_bounded(
-        self, text: str, max_seconds: float, *, prefix: str = "private"
-    ) -> tuple[Path, bool]:
-        """Synthesize *text*, kept under *max_seconds* of speech.
-
-        The cut is measured, not guessed: the first pass gives the actual
-        characters-per-second of this voice at this length scale, and the text
-        is trimmed to fit from that.  A search hit can be thousands of
-        characters, and a local readout nobody can interrupt is a bad way to
-        spend five minutes of a conversation.
-        """
-
-        path = self.synthesize(text, prefix=prefix)
-        duration = _wav_seconds(path)
-        if max_seconds <= 0.0 or duration <= max_seconds or duration <= 0.0:
-            return path, False
-        per_second = max(1.0, len(text) / duration)
-        # 8% margin: the trimmed text is not spoken at exactly the same rate.
-        keep = max(40, int(max_seconds * per_second * 0.92))
-        if keep >= len(text):
-            return path, False
-        head = text[:keep]
-        cut = max(head.rfind(ch) for ch in self._SENTENCE_ENDS)
-        if cut >= 40:
-            head = head[: cut + 1]
-        head += "以下は長いため省略しました。"
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        return self.synthesize(head, prefix=prefix), True
-
     def warm(self) -> None:
         warm_path = self.synthesize("準備完了。", prefix="warm")
         try:
@@ -170,6 +183,138 @@ class PiperSession:
                     process.kill()
                 except Exception:
                     pass
+
+
+class AivisSession(_BoundedSynthesis):
+    """AivisSpeech Engine (VOICEVOX-compatible HTTP API) as the local voice.
+
+    The privacy contract of this process is that private text never leaves the
+    machine, so the endpoint must be a loopback address (enforced here, not
+    trusted from the caller) and requests are made with an empty proxy map so
+    an HTTP(S)_PROXY environment cannot reroute them.  The engine itself is
+    started by whoever launched us; this session only talks to it.
+    """
+
+    _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.audio_dir = Path(args.audio_dir).resolve()
+        self.audio_dir.mkdir(parents=True, exist_ok=True)
+        self.endpoint = str(args.aivis_endpoint).rstrip("/")
+        host = urllib.parse.urlparse(self.endpoint).hostname or ""
+        if host not in self._LOOPBACK_HOSTS:
+            raise RuntimeError("aivis endpoint must be a loopback address")
+        self.style_id = int(args.aivis_style_id)
+        self.lock = threading.Lock()
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({})
+        )
+
+    def _post(
+        self,
+        path: str,
+        query: dict[str, Any],
+        *,
+        data: bytes | None = None,
+        content_type: str = "",
+        timeout: float,
+    ) -> bytes:
+        url = self.endpoint + path + "?" + urllib.parse.urlencode(query)
+        headers = {"Content-Type": content_type} if content_type else {}
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with self.opener.open(request, timeout=timeout) as response:
+            return response.read()
+
+    def synthesize(self, text: str, *, prefix: str = "private") -> Path:
+        with self.lock:
+            query = self._post(
+                "/audio_query",
+                {"speaker": self.style_id, "text": text},
+                timeout=30.0,
+            )
+            payload = json.loads(query.decode("utf-8"))
+            speed = float(getattr(self.args, "aivis_speed_scale", 1.0) or 1.0)
+            if speed > 0.0 and abs(speed - 1.0) > 1e-6:
+                payload["speedScale"] = speed
+            wav = self._post(
+                "/synthesis",
+                {"speaker": self.style_id},
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                content_type="application/json",
+                timeout=float(self.args.local_speech_max_seconds) + 30.0,
+            )
+            target = self.audio_dir / f"{prefix}-{uuid.uuid4().hex}.wav"
+            target.write_bytes(wav)
+            # 44 bytes is a bare WAV header; anything at or under it is a failure.
+            if not target.is_file() or target.stat().st_size <= 44:
+                raise RuntimeError("local synthesis failed")
+            return target
+
+    def warm(self) -> None:
+        with self.opener.open(self.endpoint + "/version", timeout=10.0) as response:
+            response.read()
+
+    def close(self) -> None:
+        pass
+
+
+class FallbackTTS(_BoundedSynthesis):
+    """Primary local engine with an optional Piper fallback.
+
+    The room should still hear something when the AivisSpeech engine dies
+    mid-session.  One failure latches onto the fallback for the rest of the
+    session: a dead engine stays dead, and paying an HTTP timeout per clip
+    while it is down would stall every answer.
+    """
+
+    def __init__(self, primary: Any, fallback: Any | None) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.using_fallback = False
+
+    def synthesize(self, text: str, *, prefix: str = "private") -> Path:
+        if not self.using_fallback:
+            try:
+                return self.primary.synthesize(text, prefix=prefix)
+            except Exception:
+                if self.fallback is None:
+                    raise
+                self.using_fallback = True
+        assert self.fallback is not None
+        return self.fallback.synthesize(text, prefix=prefix)
+
+    def warm(self) -> None:
+        if not self.using_fallback:
+            try:
+                self.primary.warm()
+                return
+            except Exception:
+                if self.fallback is None:
+                    raise
+                self.using_fallback = True
+        assert self.fallback is not None
+        self.fallback.warm()
+
+    def close(self) -> None:
+        for session in (self.primary, self.fallback):
+            if session is None:
+                continue
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
+def build_local_tts(args: argparse.Namespace) -> Any:
+    if getattr(args, "tts_engine", "piper") == "aivis":
+        piper = (
+            PiperSession(args)
+            if args.piper_executable and args.piper_model
+            else None
+        )
+        return FallbackTTS(AivisSession(args), piper)
+    return PiperSession(args)
 
 
 @dataclass(frozen=True)
@@ -337,7 +482,7 @@ class PrivateBroker:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.sourcevault = SourceVaultQueue(args.sourcevault_service_dir, args.timeout_seconds)
-        self.piper = PiperSession(args)
+        self.tts = build_local_tts(args)
         self.cache_lock = threading.Lock()
         self.pending: dict[str, SearchTicket] = {}
         self.ready: dict[str, dict[str, Any]] = {}
@@ -348,7 +493,7 @@ class PrivateBroker:
         self.closing = threading.Event()
 
     def start(self) -> None:
-        self.piper.warm()
+        self.tts.warm()
         _protocol_write({"type": "ready", "pid": os.getpid()})
 
     @staticmethod
@@ -514,7 +659,7 @@ class PrivateBroker:
                 "text": "SourceVaultに該当する情報は見つかりませんでした。",
             }
         if route == "LocalTTS":
-            wav_path, truncated = self.piper.synthesize_bounded(
+            wav_path, truncated = self.tts.synthesize_bounded(
                 self._private_text(result), float(self.args.local_speech_max_seconds)
             )
             # Never return private text to the OpenAI-connected parent.
@@ -597,7 +742,7 @@ class PrivateBroker:
         if action != "play":
             return {"route": "discarded"}
         try:
-            wav_path, truncated = self.piper.synthesize_bounded(
+            wav_path, truncated = self.tts.synthesize_bounded(
                 held[0], float(self.args.local_speech_max_seconds)
             )
         except Exception:
@@ -720,7 +865,7 @@ class PrivateBroker:
                     Path(wav_path).unlink()
                 except OSError:
                     pass
-        self.piper.close()
+        self.tts.close()
 
     def run(self) -> int:
         self.start()
@@ -765,8 +910,18 @@ def _parse_args() -> argparse.Namespace:
     # dropped.  Declining is an answer; holding it longer serves nothing.
     parser.add_argument("--private-hold-seconds", type=float, default=180.0)
     parser.add_argument("--background-timeout-seconds", type=float, default=600.0)
-    parser.add_argument("--piper-executable", required=True)
-    parser.add_argument("--piper-model", required=True)
+    # Local TTS engine.  "piper" needs the piper arguments below; "aivis"
+    # talks to a loopback AivisSpeech Engine and keeps piper (when given) as
+    # an in-session fallback.
+    parser.add_argument("--tts-engine", choices=["piper", "aivis"], default="piper")
+    parser.add_argument("--aivis-endpoint", default="http://127.0.0.1:10101")
+    parser.add_argument("--aivis-style-id", type=int, default=0)
+    # AivisSpeech speed (>1 = faster).  Separate from --piper-length-scale on
+    # purpose: that default (1.5) was tuned for a piper voice and would drag
+    # an AivisSpeech voice to two-thirds speed if it were mapped implicitly.
+    parser.add_argument("--aivis-speed-scale", type=float, default=1.0)
+    parser.add_argument("--piper-executable", default="")
+    parser.add_argument("--piper-model", default="")
     # Optional: piper finds <model>.onnx.json on its own when a voice ships
     # its config that way.  Only pass --config when there is one to pass.
     parser.add_argument("--piper-config", default="")
@@ -788,6 +943,8 @@ def _parse_args() -> argparse.Namespace:
     args.background_timeout_seconds = max(
         args.timeout_seconds, min(3600.0, args.background_timeout_seconds)
     )
+    if args.tts_engine == "piper" and not (args.piper_executable and args.piper_model):
+        parser.error("--piper-executable and --piper-model are required for --tts-engine piper")
     return args
 
 

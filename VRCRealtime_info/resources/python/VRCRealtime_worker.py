@@ -234,6 +234,19 @@ class PrivateTTSBrokerClient:
                 command.extend(
                     ["--piper-noise-scale", str(self.args.piper_noise_scale)]
                 )
+            if getattr(self.args, "tts_engine", "piper") == "aivis":
+                command.extend(
+                    [
+                        "--tts-engine",
+                        "aivis",
+                        "--aivis-endpoint",
+                        self.args.aivis_endpoint,
+                        "--aivis-style-id",
+                        str(self.args.aivis_style_id),
+                        "--aivis-speed-scale",
+                        str(self.args.aivis_speed_scale),
+                    ]
+                )
             if self.args.sourcevault_kb:
                 command.extend(["--sourcevault-kb", self.args.sourcevault_kb])
             if self.args.sourcevault_group:
@@ -4833,6 +4846,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--owner-presence-privacy-threshold", type=float, default=0.25
     )
+    # Local TTS engine for the private broker.  "aivis" keeps the piper
+    # arguments as an in-session fallback; all values are pass-through.
+    parser.add_argument("--tts-engine", choices=["piper", "aivis"], default="piper")
+    parser.add_argument("--aivis-endpoint", default="http://127.0.0.1:10101")
+    parser.add_argument("--aivis-style-id", type=int, default=0)
+    parser.add_argument("--aivis-speed-scale", type=float, default=1.0)
     parser.add_argument("--piper-executable", default="")
     parser.add_argument("--piper-model", default="")
     parser.add_argument("--piper-config", default="")
@@ -4968,11 +4987,14 @@ def missing_sourcevault_paths(args: Any) -> list[str]:
     required = {
         "private broker": args.private_tts_broker,
         "SourceVault service": args.sourcevault_service_dir,
-        "Piper executable": args.piper_executable,
-        "Piper model": args.piper_model,
     }
-    if getattr(args, "piper_config", ""):
-        required["Piper config"] = args.piper_config
+    # With the AivisSpeech engine the voice is an HTTP endpoint, not a file;
+    # piper paths are then an optional fallback and must not gate the start.
+    if getattr(args, "tts_engine", "piper") != "aivis":
+        required["Piper executable"] = args.piper_executable
+        required["Piper model"] = args.piper_model
+        if getattr(args, "piper_config", ""):
+            required["Piper config"] = args.piper_config
     missing = [name for name, path in required.items() if not path or not Path(path).exists()]
     if not args.private_audio_dir:
         missing.append("private audio directory")

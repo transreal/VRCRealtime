@@ -110,7 +110,7 @@ VRCRealtimeJoinNGCGalleryWorldStop::usage =
 
 Begin["`Private`"];
 
-VRCRealtime`$VRCRealtimeVersion = "0.10.0";
+VRCRealtime`$VRCRealtimeVersion = "0.10.1";
 VRCRealtime`$VRCRealtimeOwnerAccount = "nconc";
 VRCRealtime`$VRCRealtimeDefaultSlideURL =
   "https://transreal.sakura.ne.jp/cn/31.mp4";
@@ -298,9 +298,12 @@ iFallbackVoiceScan[] := Module[{roots, exe, models, dirs, onnx, cfg},
       "Language" -> "", "Multilingual" -> False|>|>
 ];
 
-(* 明示指定 > SourceVault_voice > 素の探索。返り値は必ず Association。 *)
+(* 明示指定 > SourceVault_voice > 素の探索。返り値は必ず Association。
+   解決した声が AivisSpeech のものなら "Engine" -> "Aivis" になり、broker には
+   エンドポイントとスタイル id を渡す (piper の exe/model はフォールバック)。 *)
 iResolveVoice[exeOpt_, modelOpt_, configOpt_, voiceOpt_] :=
-  Module[{layer, runtime, voice, exe, model, config, language, scan, missing = {}, hint = None},
+  Module[{layer, runtime, voice, exe, model, config, language, scan, missing = {}, hint = None,
+          engineChoice = "Piper", aivisEndpoint = "", aivisStyle = 0, aivisName = None},
     layer = iEnsureVoiceLayer[];
     If[layer,
       (* Check は使わない: SourceVaultVoice[] は「指定された声が消えていたので
@@ -325,7 +328,23 @@ iResolveVoice[exeOpt_, modelOpt_, configOpt_, voiceOpt_] :=
             StringQ[own], own,
             True, Replace[Quiet @ SourceVault`SourceVaultVoiceInstallHint[],
               Except[_String] -> hint]]];
-        voice = None],
+        voice = None];
+      (* 解決した声が AivisSpeech のもの: エンジンの応答を確かめてから採用する。
+         採用時は piper の声をフォールバックとして選び直し、応答しなければ
+         そのまま piper の声へ落とす (どちらも broker が黙り込むよりよい) *)
+      If[AssociationQ[voice] && Lookup[voice, "Engine", ""] === "AivisSpeech",
+        If[TrueQ[Quiet @ Check[
+              If[Length[DownValues[SourceVault`SourceVaultVoiceAivisEnsure]] > 0,
+                SourceVault`SourceVaultVoiceAivisEnsure[], False], False]],
+          engineChoice = "Aivis";
+          aivisEndpoint = Replace[Lookup[voice, "Model", ""], Except[_String] -> ""];
+          aivisStyle = Replace[Lookup[voice, "StyleId", 0], Except[_Integer] -> 0];
+          aivisName = Lookup[voice, "Name", None],
+          hint = "指定された声は AivisSpeech Engine のものですが、エンジンが応答しません。" <>
+            "Piper の声があればそちらへ落とします。"];
+        voice = SelectFirst[
+          Select[Quiet @ Check[SourceVault`SourceVaultVoices[], {}], AssociationQ],
+          Lookup[#, "Engine", ""] === "PiperPlus" &, None]],
     (* else: SourceVault_voice が無い環境 *)
       scan = iFallbackVoiceScan[];
       exe = scan["Executable"];
@@ -345,16 +364,25 @@ iResolveVoice[exeOpt_, modelOpt_, configOpt_, voiceOpt_] :=
     language = If[voice =!= None && TrueQ[Lookup[voice, "Multilingual", False]],
       Replace[Lookup[voice, "Language", ""], Except[_String] -> ""], ""];
 
-    If[!(StringQ[exe] && FileExistsQ[exe]), AppendTo[missing, "TTSRuntime"]];
-    If[!(StringQ[model] && FileExistsQ[model]), AppendTo[missing, "TTSVoice"]];
+    (* Aivis 採用時は piper の exe/model はフォールバック (無くても動く)。
+       Piper が主のときだけ従来どおり欠品として扱う *)
+    If[engineChoice =!= "Aivis",
+      If[!(StringQ[exe] && FileExistsQ[exe]), AppendTo[missing, "TTSRuntime"]];
+      If[!(StringQ[model] && FileExistsQ[model]), AppendTo[missing, "TTSVoice"]]];
     <|
       "Status" -> If[missing === {}, "OK", "Incomplete"],
       "Missing" -> missing,
+      "Engine" -> engineChoice,
+      "AivisEndpoint" -> aivisEndpoint,
+      "AivisStyleId" -> aivisStyle,
       "Executable" -> Replace[exe, Except[_String] -> ""],
       "Model" -> Replace[model, Except[_String] -> ""],
       "Config" -> Replace[config, Except[_String] -> ""],
       "Language" -> language,
-      "Voice" -> If[voice === None, None, Lookup[voice, "Name", None]],
+      "Voice" -> Which[
+        aivisName =!= None, aivisName,
+        voice === None, None,
+        True, Lookup[voice, "Name", None]],
       "Layer" -> If[layer, "SourceVault_voice", "Fallback"],
       "Hint" -> hint
     |>
@@ -638,6 +666,7 @@ VRCRealtimeStart[OptionsPattern[]] := Module[
    sourceVaultLimit, sourceVaultVoiceWaitSeconds, localSpeechMaxSeconds,
    ownerPresencePrivacyThreshold, privateTTSBroker, piperExecutable, piperModel,
    piperConfig, piperLanguage, privateTTSMode, privateTTSReady, voiceResolution,
+   ttsEngine, ttsAivisEndpoint, ttsAivisStyleId,
    speechLengthScale, speechNoiseScale,
    privateAudioDir, controlFile, command, environment, process,
    startupDeadline, startupState, startupReason, startupDiagnostics,
@@ -799,6 +828,9 @@ VRCRealtimeStart[OptionsPattern[]] := Module[
   piperModel = voiceResolution["Model"];
   piperConfig = voiceResolution["Config"];
   piperLanguage = voiceResolution["Language"];
+  ttsEngine = Lookup[voiceResolution, "Engine", "Piper"];
+  ttsAivisEndpoint = Lookup[voiceResolution, "AivisEndpoint", ""];
+  ttsAivisStyleId = Lookup[voiceResolution, "AivisStyleId", 0];
   speechLengthScale = Replace[OptionValue["SpeechLengthScale"],
     Automatic | None -> 0.];
   speechNoiseScale = Replace[OptionValue["SpeechNoiseScale"],
@@ -1059,6 +1091,15 @@ VRCRealtimeStart[OptionsPattern[]] := Module[
           {"--piper-length-scale", iNumberString[speechLengthScale]}, {}],
         If[NumericQ[speechNoiseScale] && N[speechNoiseScale] > 0.,
           {"--piper-noise-scale", iNumberString[speechNoiseScale]}, {}],
+        If[ttsEngine === "Aivis",
+          {"--tts-engine", "aivis",
+           "--aivis-endpoint", ttsAivisEndpoint,
+           "--aivis-style-id", ToString[ttsAivisStyleId],
+           (* SpeechLengthScale (>1 = ゆっくり) を AivisSpeech の speedScale へ
+              逆数で写す。未指定なら等速 (piper の既定 1.5 は写さない) *)
+           "--aivis-speed-scale", iNumberString[
+             If[NumericQ[speechLengthScale] && N[speechLengthScale] > 0.,
+               1./N[speechLengthScale], 1.]]}, {}],
         If[StringLength[sourceVaultKB] > 0,
           {"--sourcevault-kb", sourceVaultKB}, {}],
         If[StringLength[sourceVaultGroup] > 0,
@@ -1163,10 +1204,12 @@ VRCRealtimeStart[OptionsPattern[]] := Module[
     "SourceVaultReleaseContext" -> Replace[sourceVaultReleaseContext, "" -> None],
     (* 実際に解決した声を記録する。特定の声名は埋め込まない *)
     "PrivateTTS" -> If[TrueQ[privateTTSReady] && enableSourceVault,
-      <|"Engine" -> "PiperPlus",
+      <|"Engine" -> If[ttsEngine === "Aivis", "AivisSpeech", "PiperPlus"],
         "Voice" -> voiceResolution["Voice"],
         "Language" -> Replace[piperLanguage, "" -> Automatic],
-        "Model" -> piperModel,
+        "Model" -> If[ttsEngine === "Aivis", ttsAivisEndpoint, piperModel],
+        "FallbackModel" -> If[ttsEngine === "Aivis",
+          Replace[piperModel, "" -> None], None],
         "ResolvedBy" -> voiceResolution["Layer"]|>,
       None],
     "Instructions" -> instructions,
@@ -1281,6 +1324,8 @@ VRCRealtimeVoiceStatus[] := Module[{layer, base, resolved},
       "Status" -> resolved["Status"],
       "Missing" -> resolved["Missing"],
       "ResolvedBy" -> resolved["Layer"],
+      "SelectedEngine" -> Lookup[resolved, "Engine", "Piper"],
+      "AivisEndpoint" -> Replace[Lookup[resolved, "AivisEndpoint", ""], "" -> None],
       "SelectedVoice" -> resolved["Voice"],
       "SelectedLanguage" -> Replace[resolved["Language"], "" -> Automatic],
       "Executable" -> Replace[resolved["Executable"], "" -> None],
@@ -1668,7 +1713,10 @@ Options[VRCRealtimeJoinNGCGalleryWorld] = {
   "ApproachConsole" -> False,
   "StepTimeoutSeconds" -> 20.,
   "LoadTimeoutSeconds" -> 180.,
-  "NavigationTimeoutSeconds" -> 120.,
+  (* \:5165\:5ba4\:306f\:300c\:898b\:3048\:308b\:5834\:6240\:307e\:3067\:6b69\:304f\:300d\:3067\:306f\:6e08\:307e\:306a\:3044:
+     \:30ac\:30e9\:30b9\:58c1\:8d8a\:3057\:306b\:753b\:9762\:304c\:898b\:3048\:308b\:305f\:3081\:3001\:56de\:308a\:8fbc\:307f (\:6a2a\:6b69\:304d) \:306e\:5206\:3060\:3051
+     \:4f59\:88d5\:304c\:8981\:308b\:3002120s \:3060\:3068 4 \:672c\:76ee\:306e\:8ff4\:56de\:3067\:5207\:308c\:308b\:3002 *)
+  "NavigationTimeoutSeconds" -> 210.,
   "Wait" -> True,
   "TotalTimeoutSeconds" -> Automatic,
   "VRCpilotDirectory" -> "C:\\Users\\imai_\\gitwork\\vrcpilot",

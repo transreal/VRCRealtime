@@ -14,6 +14,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -884,6 +885,38 @@ def page_has_console_bars(page: Rect, bars: Sequence[Rect]) -> bool:
     return False
 
 
+def wordmark_width_scale(key: str) -> float | None:
+    """Read a folded OCR key as the Sliden wordmark, typos included.
+
+    The wordmark is read off a surface that is usually oblique and often
+    clipped -- by the window edge, by a door frame -- so its six letters come
+    back short or with the logo glyph counted as one more.  Live captures on
+    2026-08-21 gave "Slider", "Slide", "liden" and "V Slide" for the same wall
+    screen within seconds of each other; demanding the exact spelling made the
+    estimate below fall through to whatever other Sliden surface was in frame
+    (a sub-screen across the room reads the wordmark just the same), and the
+    approach chased the two in turn without ever moving.  Returns the factor
+    that brings a box of this many glyphs back to the width of the full six,
+    so that a truncated read does not shrink the page estimate with it, or
+    ``None`` when the text is not the wordmark at all.
+    """
+
+    if not key or "app" in key or "url" in key:
+        # "sliden.app" under the QR code and "Enter Slide URL" over the
+        # operation panel are on the page, but neither is the wordmark.
+        return None
+    forms = {key}
+    if len(key) >= 6:
+        # A stray leading letter is the logo read as a glyph.
+        forms.add(key[1:])
+    if not any(
+        len(form) >= 5 and SequenceMatcher(None, form, "sliden").ratio() >= 0.8
+        for form in forms
+    ):
+        return None
+    return 6.0 / float(max(4, min(7, len(key))))
+
+
 def screen_from_text_boxes(
     boxes: Sequence[tuple[str, Rect]],
     width: int,
@@ -914,25 +947,22 @@ def screen_from_text_boxes(
     def folded(text: str) -> str:
         return "".join(ch for ch in text.lower() if ch.isalnum())
 
-    marks: list[Rect] = []
+    marks: list[tuple[Rect, float]] = []
     captions: list[Rect] = []
     fields: list[Rect] = []
     for text, rect in boxes:
         key = folded(text)
         if not key:
             continue
-        if key.startswith("sliden") or key.endswith("sliden") or key in {"slider", "sliden"}:
-            if "app" in key and len(key) <= 10:
-                # "sliden.app" under the QR code: part of the same page, but
-                # not the wordmark.
-                continue
-            marks.append(rect)
+        scale = wordmark_width_scale(key)
+        if scale is not None:
+            marks.append((rect, scale))
         elif key == "local":
             captions.append(rect)
         elif "url" in key or key.startswith("enterslide"):
             fields.append(rect)
     best: Rect | None = None
-    for mark in marks:
+    for mark, scale in marks:
         cx, cy = mark.center
         if any(
             other.x - 0.1 * other.width <= cx <= other.right + 0.1 * other.width
@@ -940,10 +970,14 @@ def screen_from_text_boxes(
             for other in exclude
         ):
             continue
+        # Centred on the wordmark, and widened as if every letter had been
+        # read: the page is what the approach measures its distance by, so a
+        # box that lost a letter must not shrink it.
+        span = mark.width * scale
         page = Rect(
-            int(mark.x - 0.7 * mark.width),
+            int(cx - 1.2 * span),
             int(mark.y - 1.0 * mark.height),
-            int(2.4 * mark.width),
+            int(2.4 * span),
             int(3.5 * mark.height),
         )
         near_x = lambda other: page.x - 0.5 * page.width <= other.center[0] <= page.right + 0.5 * page.width  # noqa: E731

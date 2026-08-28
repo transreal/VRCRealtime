@@ -336,7 +336,7 @@ class WorldJoinSpec:
     approach_console: bool = False
     step_timeout: float = 20.0
     load_timeout: float = 180.0
-    navigation_timeout: float = 120.0
+    navigation_timeout: float = 210.0
     poll_seconds: float = 0.6
     ocr_min_side: int = 1080
 
@@ -501,7 +501,24 @@ class WorldJoinController(SlidenConsoleController):
             self._menu_snapshot(label, frame)
         return frame, boxes
 
-    def _menu_snapshot(self, label: str, frame: RGBImage) -> None:
+    def _menu_snapshot(
+        self,
+        label: str,
+        frame: RGBImage,
+        *,
+        texts: Sequence[str] | None = None,
+        note: str = "",
+    ) -> None:
+        """Write the frame and what was read on it.
+
+        ``texts`` defaults to the last menu reading, which is what the menu
+        steps want -- they all go through ``_menu_observe``.  The room search
+        reads its frames itself, so it passes its own words and a line of
+        control state: without them the log repeated the loading screen's
+        words under every one of its shots, and the live failure of
+        2026-08-21 could not be read off it at all.
+        """
+
         directory = self.diagnostic_directory
         if directory is None or self._shots_written >= self._SHOT_LIMIT:
             return
@@ -514,8 +531,11 @@ class WorldJoinController(SlidenConsoleController):
                 str(directory / f"{index:02d}-{safe}.png"),
                 cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
             )
+            seen = list(self.last_texts if texts is None else texts)[:60]
+            suffix = f" {note}" if note else ""
+            line = f"{index:02d} {label}:{suffix} {seen!r}" + chr(10)
             with (directory / "texts.log").open("a", encoding="utf-8") as log:
-                log.write(f"{index:02d} {label}: {self.last_texts!r}\n")
+                log.write(line)
         except Exception:
             self.diagnostic_directory = None
 
@@ -920,6 +940,157 @@ class WorldJoinController(SlidenConsoleController):
         self._done_step("world_loaded")
         return {"loadedBy": loaded_by, "seconds": seconds}
 
+    #: The room loop settles for this long after a look correction and after
+    #: a walking pulse.  It used to settle for ``poll_seconds`` (0.6s live)
+    #: after both, which put one control iteration at about a second: the
+    #: whole navigation budget bought a hundred moves, nearly all of them
+    #: aiming.
+    _AIM_SETTLE_SECONDS = 0.12
+    _MOVE_SETTLE_SECONDS = 0.18
+    #: Aiming for longer than this without a step means the servo cannot
+    #: centre what it is looking at.  Walk anyway -- that is what makes the
+    #: blocked-walk probe fire, and the escape after it run.
+    _AIM_SECONDS = 3.0
+    #: A target that has not grown for this long is not being approached:
+    #: something stands between the avatar and it.
+    _APPROACH_PATIENCE_SECONDS = 9.0
+    #: Mean absolute frame difference (0-1) below which the view counts as
+    #: unchanged, so the walk before it moved the avatar nowhere.  Measured
+    #: over the 2026-08-21 captures: a view that really changed gave back a
+    #: median of 0.10, and the frames either side of a shove at the glass
+    #: were byte-identical.  Same figure as ``_escape_to_open_space`` uses.
+    _BLOCKED_MOTION = 0.02
+    #: How far the wall screen may jump between frames and still be taken for
+    #: the same surface, as a fraction of the frame.
+    _TRACK_WINDOW = 0.22
+    #: Where to side-step when the way is blocked, and for how many steps:
+    #: one way, then further back the other.  Each step is about a metre.
+    _ESCAPE_LEGS = ((1, 4), (-1, 7), (1, 10), (-1, 13))
+
+    def _survey_for_sliden(self) -> int | None:
+        """Turn a full circle and come back facing the largest Sliden page.
+
+        Every Sliden surface in this world reads "Sliden" -- the wall screen,
+        its sub-screens, the operation panel, the displays out in the gallery
+        -- so walking at the first one seen took the avatar to a small
+        far-away sign, or at the wall screen through the glass wall it cannot
+        pass.  Only pages seen at this pitch count; one never seen here is
+        left to the sweep in the loop below.
+        """
+
+        self.level_camera()
+        steps = 12
+        counts = self._YAW_COUNTS_PER_360 / steps
+        best_step: int | None = None
+        best_width = 0
+        for step in range(steps):
+            _check_cancel(self.cancelled)
+            frame = self._capture()
+            if frame is not None:
+                boxes = self._ensure_ocr()(frame)
+                estimated = screen_from_text_boxes(
+                    [(b.text, b.rect) for b in boxes], frame.shape[1], frame.shape[0],
+                    exclude=console_page_rects(frame),
+                    bars=[bar for bar, _l, _t in _bright_horizontal_bars(frame)],
+                )
+                if estimated is not None and estimated.width > best_width:
+                    best_width = estimated.width
+                    best_step = step
+                self._state(
+                    worldJoinRoomStatus="surveying",
+                    worldJoinRoomSurveyStep=step,
+                    worldJoinRoomSurveyBest=None if best_step is None else [best_step, best_width],
+                )
+            self._move_relative((counts, 0.0))
+            time.sleep(max(0.15, self.poll_seconds))
+        if best_step is not None:
+            # A full revolution later the view is where it started; turn back
+            # to the best step by the same exact counts.
+            self._move_relative((counts * best_step, 0.0))
+            time.sleep(max(0.2, self.poll_seconds))
+        return best_step
+
+    def _advance(self, seconds: float) -> bool:
+        """Walk one pulse forward; ``False`` when the view did not move.
+
+        The lounge is behind a glass wall with the wall screen in plain sight
+        through it.  "The target is centred, so walk at it" can therefore run
+        for the whole budget with the avatar pressed against the glass and
+        not an inch nearer, which is exactly how the live run of 2026-08-21
+        spent its 120 seconds.  Comparing the view before and after the pulse
+        is what tells walking from shoving.
+        """
+
+        before = self._capture()
+        self._walk_forward(seconds)
+        time.sleep(self._MOVE_SETTLE_SECONDS)
+        after = self._capture()
+        if before is None or after is None:
+            return True
+        motion = self._frame_motion(before, after)
+        self._state(worldJoinRoomMotion=round(motion, 4))
+        return motion >= self._BLOCKED_MOTION
+
+    def _slip_along_obstacle(self, direction: int, steps: int) -> bool:
+        """Side-step along what blocks the way, trying to walk on after each.
+
+        Facing the wall screen through the glass, forward is blocked and
+        sideways is not, so sliding along the facade and probing forward
+        after every side step walks the avatar to where the glass ends -- the
+        doorway -- and through it.  Returns True as soon as a forward step
+        moves; False if sideways is blocked too, which means a corner and
+        calls for the heavier recovery.
+        """
+
+        self._state(
+            worldJoinRoomStatus="sidestepping",
+            worldJoinRoomSidestepDirection=direction,
+            worldJoinRoomSidestepSteps=steps,
+        )
+        self._walk_backward(0.20)
+        time.sleep(self._MOVE_SETTLE_SECONDS)
+        for step in range(max(1, steps)):
+            _check_cancel(self.cancelled)
+            before = self._capture()
+            self._strafe(0.60, direction)
+            time.sleep(self._MOVE_SETTLE_SECONDS)
+            after = self._capture()
+            if (
+                before is not None
+                and after is not None
+                and self._frame_motion(before, after) < self._BLOCKED_MOTION
+            ):
+                self._state(worldJoinRoomStatus="cornered", worldJoinRoomSidestepDone=step)
+                return False
+            # Two steps, not one: the small back-off above buys a free
+            # first step straight back to the obstacle, which on its own
+            # reads exactly like having got round it.
+            if self._advance(0.30) and self._advance(0.30):
+                self._state(worldJoinRoomStatus="slipped_past", worldJoinRoomSidestepDone=step + 1)
+                return True
+        return False
+
+    def _recover_position(self) -> None:
+        """Leave a spot the room cannot be reached from.
+
+        The spawn point is a known place the room has been walked to from
+        before, so a respawn is the cleanest way out of a trap; if the menu
+        will not give one, any patch of floor the avatar can actually walk on
+        will do.  Either way the survey has to run again: the view is
+        somewhere else entirely.
+        """
+
+        self._state(worldJoinRoomStatus="recovering")
+        respawned = False
+        try:
+            respawned = self.respawn_via_menu()
+        except WorldJoinError:
+            respawned = False
+        if not respawned:
+            self._escape_to_open_space()
+        self._phase("entering_room")
+        self._survey_for_sliden()
+
     def enter_sliden_room(
         self,
         *,
@@ -939,6 +1110,14 @@ class WorldJoinController(SlidenConsoleController):
         operation panel's edge-on bar beside the screen is too thin to be
         seen (a live run from 0.24 never found it), and the panel approach
         that follows backs off by itself if the screen is clipped.
+
+        The screen is visible from outside the room through its glass wall,
+        so seeing it is not being able to reach it.  Three things keep that
+        from eating the budget: the surface being approached is tracked, so a
+        far-off Sliden page cannot steal the aim; every walking pulse is
+        checked against the view to see whether the avatar moved at all; and
+        a target that stops growing, or two pulses that move nothing, send
+        the avatar side-stepping along the obstacle to find its way round.
         """
 
         self._phase("entering_room")
@@ -947,51 +1126,20 @@ class WorldJoinController(SlidenConsoleController):
         sweep_seconds = 0.0
         sweep_index = 0
         align_attempts = 0
-        stall_count = 0
         best_seen_width = 0.0
-        strafes = 0
         best_confidence = 0.0
         arrival_rejects = 0
         steer_attempts = 0
+        blocked = 0
+        escapes = 0  # legs of the current schedule, reset by a recovery
+        escapes_total = 0
+        lock: Rect | None = None
+        lock_misses = 0
         rejected_candidates: list[tuple[float, float]] = []
         bands = self._SCREEN_PITCH_BANDS
-        self.level_camera()
-        # Look all the way round first and turn to the biggest Sliden page in
-        # sight.  Every Sliden surface in this world reads "Sliden" -- the
-        # wall screen, its sub-screens, the panel, and displays in the
-        # gallery outside -- and walking at the first one seen took the
-        # avatar to a small far-away sign, or to the wall screen through the
-        # glass wall it cannot pass.  Only pages seen at this pitch count; a
-        # page never seen in the survey is left to the sweep below.
-        survey_steps = 12
-        survey_counts = self._YAW_COUNTS_PER_360 / survey_steps
-        best_step: int | None = None
-        best_survey_width = 0
-        for step in range(survey_steps):
-            _check_cancel(self.cancelled)
-            frame = self._capture()
-            if frame is not None:
-                boxes = self._ensure_ocr()(frame)
-                estimated = screen_from_text_boxes(
-                    [(b.text, b.rect) for b in boxes], frame.shape[1], frame.shape[0],
-                    exclude=console_page_rects(frame),
-                    bars=[bar for bar, _l, _t in _bright_horizontal_bars(frame)],
-                )
-                if estimated is not None and estimated.width > best_survey_width:
-                    best_survey_width = estimated.width
-                    best_step = step
-                self._state(
-                    worldJoinRoomStatus="surveying",
-                    worldJoinRoomSurveyStep=step,
-                    worldJoinRoomSurveyBest=None if best_step is None else [best_step, best_survey_width],
-                )
-            self._move_relative((survey_counts, 0.0))
-            time.sleep(max(0.15, self.poll_seconds))
-        if best_step is not None:
-            # A full revolution later the view is where it started; turn back
-            # to the best step by the same exact counts.
-            self._move_relative((survey_counts * best_step, 0.0))
-            time.sleep(max(0.2, self.poll_seconds))
+        aim_until = time.monotonic() + self._AIM_SECONDS
+        last_gain = time.monotonic()
+        self._survey_for_sliden()
         while time.monotonic() < deadline:
             _check_cancel(self.cancelled)
             frame = self._capture()
@@ -1008,7 +1156,6 @@ class WorldJoinController(SlidenConsoleController):
                 target, source = screen.rect, "screen"
             else:
                 boxes = self._ensure_ocr()(frame)
-                self._menu_snapshot("room_search", frame)
                 # The wordmark inflated to its page -- with the sub-screens
                 # ("Local" under the page) and the operation panel ("Enter
                 # Slide URL" above it) left out, so that standing next to
@@ -1021,10 +1168,46 @@ class WorldJoinController(SlidenConsoleController):
                 if estimated is not None:
                     target = estimated
                     source = "wordmark"
+                self._menu_snapshot(
+                    "room_search", frame,
+                    texts=[b.text for b in boxes],
+                    note=(
+                        "none" if estimated is None else
+                        f"w={estimated.width / width:.3f} at {estimated.center[0]:.0f}"
+                    ),
+                )
+            if target is not None and lock is not None:
+                # Keep to the surface already being approached.  Every Sliden
+                # page reads the same, and a truncated read of the near one
+                # ("Slide", "liden") used to hand the aim to a sub-screen
+                # across the room: the servo then turned back and forth
+                # between the two for the whole budget, walking nowhere and
+                # never reaching the code below that would have noticed.
+                strayed = (
+                    abs(target.center[0] - lock.center[0]) > self._TRACK_WINDOW * width
+                    or abs(target.center[1] - lock.center[1]) > self._TRACK_WINDOW * height
+                )
+                if strayed and target.width < lock.width:
+                    lock_misses += 1
+                    self._state(
+                        worldJoinRoomStatus="ignored_other_page",
+                        worldJoinRoomLockMisses=lock_misses,
+                    )
+                    if lock_misses < 5:
+                        time.sleep(self._AIM_SETTLE_SECONDS)
+                        continue
+                    # Gone for good: the locked surface is out of sight.
+                    lock = None
+                    lock_misses = 0
             if target is not None:
+                lock = target
+                lock_misses = 0
                 fraction = target.width / width
                 error_x = float(target.center[0] - viewport[0])
                 error_y = float(target.center[1] - viewport[1])
+                if fraction > best_seen_width + 0.004:
+                    best_seen_width = fraction
+                    last_gain = time.monotonic()
                 self._state(
                     worldJoinRoomLandmark=source,
                     worldJoinRoomWidthFraction=round(fraction, 3),
@@ -1033,7 +1216,7 @@ class WorldJoinController(SlidenConsoleController):
                 )
                 if fraction > maximum_width_fraction:
                     self._walk_backward(0.28)
-                    time.sleep(max(0.18, self.poll_seconds))
+                    time.sleep(self._MOVE_SETTLE_SECONDS)
                     continue
                 if fraction >= target_width_fraction:
                     if abs(error_y) > 0.14 * height and align_attempts < 8:
@@ -1041,7 +1224,7 @@ class WorldJoinController(SlidenConsoleController):
                         self._move_relative(
                             (0.0, self._pitch_step(max(-55.0, min(55.0, 0.22 * error_y))))
                         )
-                        time.sleep(max(0.10, self.poll_seconds))
+                        time.sleep(self._AIM_SETTLE_SECONDS)
                         continue
                     # Not the wall screen if, from this close, the page shows
                     # console or sub-screen furniture: the operation panel and
@@ -1060,10 +1243,11 @@ class WorldJoinController(SlidenConsoleController):
                         )
                     ) and arrival_rejects < 4:
                         arrival_rejects += 1
+                        lock = None
                         self._state(worldJoinRoomStatus="rejected_console_page",
                                     worldJoinRoomRejects=arrival_rejects)
                         self._scan_turn(0.30, 1)
-                        time.sleep(max(0.18, self.poll_seconds))
+                        time.sleep(self._MOVE_SETTLE_SECONDS)
                         continue
                     if source != "screen":
                         self._warn("arrived on the Sliden wordmark; the wall screen detector never confirmed it")
@@ -1083,44 +1267,54 @@ class WorldJoinController(SlidenConsoleController):
                     return result
                 move_x = max(-55.0, min(55.0, 0.24 * error_x)) if abs(error_x) > 0.08 * width else 0.0
                 move_y = max(-55.0, min(55.0, 0.22 * error_y)) if abs(error_y) > 0.10 * height else 0.0
-                if (move_x != 0.0 or move_y != 0.0) and align_attempts < 12:
+                if (
+                    (move_x != 0.0 or move_y != 0.0)
+                    and align_attempts < 12
+                    and time.monotonic() < aim_until
+                ):
                     align_attempts += 1
                     self._move_relative((move_x, self._pitch_step(move_y)))
-                    time.sleep(max(0.10, self.poll_seconds))
+                    time.sleep(self._AIM_SETTLE_SECONDS)
                     continue
                 align_attempts = 0
-                if fraction <= best_seen_width + 0.002:
-                    stall_count += 1
-                else:
-                    stall_count = 0
-                best_seen_width = max(best_seen_width, fraction)
-                if stall_count >= 4:
-                    # Walking is not bringing it closer: the glass wall of
-                    # the room, a door frame, furniture.  Slide sideways --
-                    # in one direction for a while, then the other for
-                    # longer -- so the avatar drifts along the obstacle to
-                    # where it ends (the doorway) rather than shuffling on
-                    # the spot, which alternating steps amount to.
-                    stall_count = 0
-                    best_seen_width = fraction
-                    strafes += 1
-                    leg = 1
-                    while strafes > 3 * leg * (leg + 1) // 2:
-                        leg += 1
-                    direction = 1 if leg % 2 else -1
-                    self._state(worldJoinRoomStatus="sidestepping",
-                                worldJoinRoomSidesteps=strafes, worldJoinRoomSidestepDirection=direction)
-                    self._walk_backward(0.20)
-                    self._strafe(0.55, direction)
-                    time.sleep(max(0.18, self.poll_seconds))
+                moved = self._advance(0.42 if fraction < 0.18 else 0.26)
+                aim_until = time.monotonic() + self._AIM_SECONDS
+                blocked = 0 if moved else blocked + 1
+                stalled = time.monotonic() - last_gain > self._APPROACH_PATIENCE_SECONDS
+                if blocked < 2 and not stalled:
                     continue
-                self._walk_forward(0.42 if fraction < 0.18 else 0.22)
-                time.sleep(max(0.18, self.poll_seconds))
+                # Walking is not bringing the screen closer: the glass wall
+                # of the room, a door frame, furniture.  Slide along it --
+                # one way for a while, then the other for longer -- so the
+                # avatar drifts to where the obstacle ends rather than
+                # shuffling on the spot, which alternating steps amount to.
+                escapes_total += 1
+                self._state(
+                    worldJoinRoomStatus="blocked" if blocked >= 2 else "not_gaining",
+                    worldJoinRoomBlocked=blocked,
+                    worldJoinRoomEscapes=escapes_total,
+                )
+                blocked = 0
+                if escapes < len(self._ESCAPE_LEGS):
+                    direction, steps = self._ESCAPE_LEGS[escapes]
+                    escapes += 1
+                    self._slip_along_obstacle(direction, steps)
+                else:
+                    escapes = 0
+                    self._recover_position()
+                lock = None
+                lock_misses = 0
+                best_seen_width = 0.0
+                last_gain = time.monotonic()
+                aim_until = time.monotonic() + self._AIM_SECONDS
                 continue
             # Nothing recognisable yet.  A dark page candidate in view -- the
             # wall screen with its wordmark out of frame, typically -- is
             # worth centring first, so its text can be read; otherwise sweep
             # to the right, one pitch band per turn.
+            lock_misses += 1
+            if lock_misses >= 3:
+                lock = None
             candidates = [
                 c for c in _display_candidates(frame, minimum_area_fraction=0.004)
                 if not page_has_console_bars(
@@ -1142,7 +1336,7 @@ class WorldJoinController(SlidenConsoleController):
                     self._move_relative((
                         max(-55.0, min(55.0, 0.24 * error_x)),
                         self._pitch_step(max(-55.0, min(55.0, 0.22 * error_y)))))
-                    time.sleep(max(0.10, self.poll_seconds))
+                    time.sleep(self._AIM_SETTLE_SECONDS)
                     continue
                 # Centred and still no wordmark: not a Sliden page after all.
                 rejected_candidates.append(cand.center)
@@ -1155,7 +1349,8 @@ class WorldJoinController(SlidenConsoleController):
                 worldJoinRoomBestConfidence=round(best_confidence, 3),
             )
             best_seen_width = 0.0
-            stall_count = 0
+            last_gain = time.monotonic()
+            blocked = 0
             if sweep_seconds + 0.16 > full_turn_seconds:
                 sweep_seconds = 0.0
                 sweep_index += 1
@@ -1169,12 +1364,12 @@ class WorldJoinController(SlidenConsoleController):
                 self._set_pitch(bands[sweep_index % len(bands)])
                 self._scan_turn(0.16, 1)
                 sweep_seconds += 0.16
-            time.sleep(max(0.18, self.poll_seconds))
+            time.sleep(self._MOVE_SETTLE_SECONDS)
         self._set_pitch(0.0)
         raise WorldJoinError(
             "the Sliden wall screen was not reached within "
             f"{self.spec.navigation_timeout:.0f}s (best screen confidence "
-            f"{best_confidence:.2f}, {sweep_index} sweeps)"
+            f"{best_confidence:.2f}, {sweep_index} sweeps, {escapes_total} escapes)"
         )
 
     def respawn_via_menu(self) -> bool:
