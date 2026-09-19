@@ -387,6 +387,50 @@ class SourceVaultQueue:
         os.replace(temporary, request_path)
         return SearchTicket(command_id, request_path, temporary, done_path)
 
+    #: How long the service may treat this process as an interactive client
+    #: without hearing from it again.  Short on purpose: a broker that dies
+    #: must stop holding maintenance back, and it only takes one missed renewal
+    #: plus a margin to notice.
+    LEASE_TTL_SECONDS = 120.0
+    LEASE_RENEW_SECONDS = 30.0
+
+    def renew_interactive_lease(self, holder: str = "VRCRealtime") -> None:
+        """Tell the service a client is waiting on sub-second command turnaround.
+
+        The service loop is single-threaded: while a maintenance tick runs (up
+        to 300 s for the Cane anomaly tick, 720 s for the TurnWiki one) nothing
+        in commands/ is read at all, and a voice request gives up after 60 s.
+        On 2026-09-04 that lost a presentation whose deck was registered.  The
+        lease says "hold the housekeeping"; the freshness of this file is what
+        the service reads, so writing it *is* renewing it.
+        """
+
+        path = self.service_dir / "interactive.lease.json"
+        temporary = path.with_suffix(".json.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "Holder": holder,
+                        "PID": os.getpid(),
+                        "TTLSeconds": self.LEASE_TTL_SECONDS,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        except OSError:
+            # A lease that cannot be written only costs latency, never
+            # correctness: the caller keeps working without it.
+            pass
+
+    def release_interactive_lease(self) -> None:
+        try:
+            (self.service_dir / "interactive.lease.json").unlink()
+        except OSError:
+            pass
+
     @staticmethod
     def _cleanup(ticket: SearchTicket) -> None:
         for path in (ticket.request_path, ticket.temporary_path, ticket.done_path):
@@ -494,7 +538,24 @@ class PrivateBroker:
 
     def start(self) -> None:
         self.tts.warm()
+        if isinstance(self.sourcevault, SourceVaultQueue):
+            # Held for the whole voice session, not per request: the tick that
+            # starves a lookup starts before the request does, so claiming the
+            # lease at request time would be too late.
+            self.sourcevault.renew_interactive_lease()
+            threading.Thread(
+                target=self._interactive_lease_worker,
+                name="SourceVaultInteractiveLease",
+                daemon=True,
+            ).start()
         _protocol_write({"type": "ready", "pid": os.getpid()})
+
+    def _interactive_lease_worker(self) -> None:
+        queue = self.sourcevault
+        if not isinstance(queue, SourceVaultQueue):
+            return
+        while not self.closing.wait(queue.LEASE_RENEW_SECONDS):
+            queue.renew_interactive_lease()
 
     @staticmethod
     def _followup_query(query: str) -> bool:
@@ -850,6 +911,8 @@ class PrivateBroker:
 
     def close(self) -> None:
         self.closing.set()
+        if isinstance(self.sourcevault, SourceVaultQueue):
+            self.sourcevault.release_interactive_lease()
         with self.cache_lock:
             tickets = list(self.pending.values())
             ready = list(self.ready.values())

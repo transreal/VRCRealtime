@@ -21,7 +21,11 @@ $VRCRealtimeDefaultSlideURL::usage =
   "$VRCRealtimeDefaultSlideURL is the default Sliden MP4 URL used by automatic presentations.";
 
 VRCRealtimeStart::usage =
-  "VRCRealtimeStart[] は OpenAI Realtime と VRChat の音声ブリッジを外部プロセスで起動し、直ちに制御情報を返す。
+  "VRCRealtimeStart[] は OpenAI の音声モデルと VRChat の音声ブリッジを外部プロセスで起動し、直ちに制御情報を返す。
+" <>
+  "既定のモデルは GPT-Live (\"Model\" -> \"gpt-live-1\")。道具 (SourceVault 検索・発表操作・アバター操作・画面を見る等) は Responses 委譲でバックエンドモデル (\"LiveBackendModel\"、既定 gpt-5.6-luna) が実行し、GPT-Live が結果を話す。\"Model\" -> \"gpt-realtime-2.1\" で従来の Realtime 経路。\"API\" -> \"Realtime\"|\"Live\" で明示もできる (既定 Automatic = モデル名で判定)。
+" <>
+  "\"QuestionMode\" は発表中の質問の受け方: \"QuestionTime\" (既定。スライドの区切りでだけ質問を受ける) / \"Keywords\" (特定ワード。区切りに加えて、発表中でも「質問」「スライド」「プレゼン」「発表」(\"InterruptWords\") を含む発話で中断して質問を受け、終われば中断した文から再開。「発表を中断して」で一時停止もできる。ローカル Vosk 認識が必要) / \"Detect\" (二段構え。区切りに加えて、発表中に声が続いたら一旦止め、モデルが自分への質問か判断して応じ、違えば続ける)。どのモードでもスライドの区切りでは「質問があればどうぞ」と表示して \"QuestionSeconds\" 待つ。実行中は VRCRealtimeSetQuestionMode か、音声で「質問モードを切り替えたい」と言えば会話で選べる。
 " <>
   "オーナー追尾 (\"AvatarMode\" -> \"OwnerFollow\") は既定で幾何制御エンジン (\"OwnerFollowEngine\" -> \"Formation\") を使う: ネームプレート OCR で発見 → 体のランドマークで距離 (\"OwnerFollowDistanceMeters\"、既定 1.8 m) まで接近 → 向きを推定してオーナーの左後方 (\"OwnerFollowRearAngleDegrees\"、既定 35) へ回り込み → オーナーを視野右端 (\"OwnerFollowOwnerBearingDegrees\"、既定 33 度) に置いて停止。ヨーは相対マウス入力 (3600 counts/360 度) で決定論的に回す。\"Legacy\" で旧 OSC ボタン制御に戻せる。";
 
@@ -63,10 +67,20 @@ VRCRealtimePresentationStatus::usage =
   "VRCRealtimePresentationStatus[] returns the automatic Sliden presentation state.";
 
 VRCRealtimePresentationControl::usage =
-  "VRCRealtimePresentationControl[\"Pause\"|\"Resume\"|\"Stop\"] は実行中の発表を一時停止・再開・停止する。音声の「一時停止して」「再開して」「打ち切って」と同じ経路を通る。";
+  "VRCRealtimePresentationControl[\"Pause\"|\"Resume\"|\"Stop\"] は実行中の発表を一時停止・再開・停止する。音声の「一時停止して」「再開して」「打ち切って」と同じ経路を通る。\n" <>
+  "質疑応答中にスライドを動かすと、発表側が「表示中のスライドから続けますか、元の位置へ戻りますか」と尋ねてくる。\n" <>
+  "その返事は \"ResumeHere\" (表示中のスライドから続ける) / \"ResumeBack\" (発表が進んでいた位置へ戻る) で返せる。";
 
 VRCRealtimeStopPresentation::usage =
   "VRCRealtimeStopPresentation[] stops the current automatic Sliden presentation.";
+
+VRCRealtimeSetQuestionMode::usage =
+  "VRCRealtimeSetQuestionMode[\"QuestionTime\"|\"Keywords\"|\"Detect\"] は発表中の質問の受け方を実行中に切り替える (発表の途中でも次の発話から効く)。\n" <>
+  "QuestionTime = 質問タイム (スライドの区切りでだけ受ける)、Keywords = 特定ワード (区切りに加えて「質問」「スライド」「プレゼン」「発表」で中断して受け、終われば中断した文から再開。「発表を中断して」で一時停止)、Detect = 二段構え (区切りに加えて、声が続いたら止め、モデルが質問か判断)。\n" <>
+  "音声で「質問モードを切り替えたい」と言っても同じ: モデルが 3 つを説明して尋ね、答えに従って設定する。";
+
+VRCRealtimeQuestionMode::usage =
+  "VRCRealtimeQuestionMode[] は実行中のワーカーの質問モード (\"QuestionTime\"|\"Keywords\"|\"Detect\") を返す。";
 
 
 VRCRealtimeSetOwnerAccount::usage =
@@ -110,7 +124,7 @@ VRCRealtimeJoinNGCGalleryWorldStop::usage =
 
 Begin["`Private`"];
 
-VRCRealtime`$VRCRealtimeVersion = "0.10.1";
+VRCRealtime`$VRCRealtimeVersion = "0.11.0";
 VRCRealtime`$VRCRealtimeOwnerAccount = "nconc";
 VRCRealtime`$VRCRealtimeDefaultSlideURL =
   "https://transreal.sakura.ne.jp/cn/31.mp4";
@@ -167,6 +181,22 @@ iResolveNotebook[Automatic] := Quiet @ Check[EvaluationNotebook[], $Failed];
 iResolveNotebook[nb_] := nb;
 
 iNumberString[value_] := ToString[value, InputForm];
+
+(* 質問モードの名前: WL 側は "QuestionTime" | "Keywords" | "Detect"、ワーカー
+   (Python) 側は question_time | keywords | detect。日本語名とパレット由来の
+   別名 ("Words" = 特定ワード) も受ける。不明なら $Failed。 *)
+iQuestionModeWire[mode_] := Replace[
+  If[StringQ[mode], ToLowerCase @ StringReplace[StringTrim[mode], {"-" -> "_", " " -> "_"}], mode],
+  {
+    "questiontime" | "question_time" | "質問タイム" -> "question_time",
+    "keywords" | "keyword" | "words" | "特定ワード" -> "keywords",
+    "detect" | "二段構え" -> "detect",
+    _ -> $Failed
+  }];
+
+iQuestionModeName[wire_] := Replace[iQuestionModeWire[wire], {
+  "question_time" -> "QuestionTime", "keywords" -> "Keywords",
+  "detect" -> "Detect", _ -> Missing["Unknown"]}];
 
 iResolveUV[path_String] := Module[{expanded = ExpandFileName[path]},
   If[FileExistsQ[expanded], expanded, $Failed]
@@ -231,12 +261,43 @@ iResolveSourceVaultServiceDirectory[_] := $Failed;
    止まっていることを報告して起動を試みる。
    起動できたらサービスの runtime ディレクトリも現れるので、呼び出し側は
    この後に必ず解決し直すこと。 *)
-iEnsureSourceVaultService[] := Module[{result, deadline},
+(* proxy の /health は proxy 自身 (別プロセス) が答えるので、service カーネルが
+   保守フックの中で固まっていても通ってしまう。発表登録簿を引けるかどうかを
+   決めるのは command queue が読まれているかで、それは queue を一往復させないと
+   分からない (2026-09-04 実機: /health は健全、Cane anomaly tick が 300s 焼いて
+   いる間に SlideDeckLookup が 60s で timeout し、発表が始まらなかった)。 *)
+iSourceVaultQueueResponsive[timeout_] := Module[{t0, r},
+  If[Length[DownValues[SourceVault`SourceVaultServicePing]] === 0,
+    Return[<|"Checked" -> False|>]];
+  t0 = AbsoluteTime[];
+  r = Quiet @ Check[
+    SourceVault`SourceVaultServicePing["sourcevault", "TimeoutSeconds" -> timeout],
+    $Failed];
+  <|"Checked" -> True,
+    "Responsive" -> TrueQ[AssociationQ[r] && TrueQ[Lookup[r, "Pong", False]]],
+    "LatencySeconds" -> Round[AbsoluteTime[] - t0, 0.01]|>];
+
+(* 保守フックを見送らせる lease。broker が 30 秒ごとに張り直すが、最初の一枚は
+   ここで張る: worker より先に張っておかないと、起動直後に期限の来た保守 tick が
+   走り出し、最初の発表要求がその中に沈む。 *)
+iHoldSourceVaultInteractiveLease[] :=
+  If[Length[DownValues[SourceVault`SourceVaultServiceInteractiveLease]] > 0,
+    TrueQ[AssociationQ[Quiet @ Check[
+      SourceVault`SourceVaultServiceInteractiveLease["ServiceId" -> "sourcevault",
+        "Holder" -> "VRCRealtime"], $Failed]]],
+    False];
+
+iEnsureSourceVaultService[] := Module[{result, deadline, ping},
   If[Length[DownValues[SourceVault`SourceVaultMCPRunningQ]] === 0,
     Return[<|"Status" -> "Unavailable", "Reason" -> "ServiceManagerAbsent",
       "Started" -> False|>]];
   If[TrueQ[Quiet @ Check[SourceVault`SourceVaultMCPRunningQ[], False]],
-    Return[<|"Status" -> "Running", "Started" -> False|>]];
+    iHoldSourceVaultInteractiveLease[];
+    ping = iSourceVaultQueueResponsive[6.];
+    If[TrueQ[Lookup[ping, "Checked", False]] &&
+       ! TrueQ[Lookup[ping, "Responsive", False]],
+      Message[VRCRealtimeStart::mcpbusy, 6]];
+    Return[<|"Status" -> "Running", "Started" -> False, "Queue" -> ping|>]];
   Message[VRCRealtimeStart::mcpstopped];
   result = Quiet @ Check[SourceVault`SourceVaultStartMCP[], $Failed];
   (* 起動は proxy → service kernel → /health の順に立ち上がるので即座には
@@ -246,7 +307,9 @@ iEnsureSourceVaultService[] := Module[{result, deadline},
   While[AbsoluteTime[] < deadline,
     Pause[1.];
     If[TrueQ[Quiet @ Check[SourceVault`SourceVaultMCPRunningQ[], False]],
-      Return[<|"Status" -> "Started", "Started" -> True, "Result" -> result|>]]];
+      iHoldSourceVaultInteractiveLease[];
+      Return[<|"Status" -> "Started", "Started" -> True, "Result" -> result,
+        "Queue" -> iSourceVaultQueueResponsive[6.]|>]]];
   Message[VRCRealtimeStart::mcpfailed,
     If[AssociationQ[result], Lookup[result, "Status", "unknown"], ToString[result]]];
   <|"Status" -> "StartFailed", "Started" -> True, "Result" -> result|>
@@ -511,7 +574,17 @@ iSendCommand[command_Association] := Module[{json, temporary, wrote = False},
 ];
 
 Options[VRCRealtimeStart] = {
-  "Model" -> "gpt-realtime-2.1",
+  (* 既定は GPT-Live。道具は Responses 委譲のバックエンドが実行する。
+     "gpt-realtime-2.1" で従来の Realtime 経路に戻せる。 *)
+  "Model" -> "gpt-live-1",
+  "API" -> Automatic,
+  "LiveBackendModel" -> Automatic,
+  (* 発表中の質問の受け方。"QuestionTime" | "Keywords" | "Detect" *)
+  "QuestionMode" -> "QuestionTime",
+  "InterruptWords" -> Automatic,
+  (* GPT-Live のみ: 発表中以外は話しながらも部屋の声を聞く (全二重)。
+     False で Realtime と同じ半二重 (話している間と直後 1.2 秒は聞かない) *)
+  "FullDuplex" -> True,
   "Voice" -> "marin",
   "Instructions" -> "日本語で自然かつ簡潔に会話してください。",
   "VRCpilotDirectory" -> "C:\\Users\\imai_\\gitwork\\vrcpilot",
@@ -635,6 +708,11 @@ VRCRealtimeStart::mcpfailed =
   "SourceVault MCP サービスを起動できませんでした (`1`)。"
   "SourceVaultMCPStatus[] を確認してください。";
 
+VRCRealtimeStart::mcpbusy =
+  "SourceVault MCP サービスは動いていますが、command queue が `1` 秒以内に応答しません \
+(保守 tick の実行中と思われます)。この間は発表登録簿を引けず、発表を頼まれても \
+開始できません。数分おいてから発表を始めてください。";
+
 VRCRealtimeStart::novoice =
   "ローカル音声合成を使えないため (未解決: `1`) SourceVault 連携を切って起動します \
 (非公開資料は取得も読み上げもされません)。`2`";
@@ -670,7 +748,8 @@ VRCRealtimeStart[OptionsPattern[]] := Module[
    speechLengthScale, speechNoiseScale,
    privateAudioDir, controlFile, command, environment, process,
    startupDeadline, startupState, startupReason, startupDiagnostics,
-   sourceVaultService, existingLock, replacedWorker},
+   sourceVaultService, existingLock, replacedWorker,
+   api, liveBackendModel, questionMode, interruptWords},
 
   If[iProcessRunningQ[],
     Return[iFailure["AlreadyRunning", "VRCRealtime worker is already running.",
@@ -720,6 +799,21 @@ VRCRealtimeStart[OptionsPattern[]] := Module[
   ];
 
   model = OptionValue["Model"];
+  api = Replace[OptionValue["API"], {Automatic -> "auto", s_String :> ToLowerCase[s]}];
+  liveBackendModel = Replace[OptionValue["LiveBackendModel"], Automatic | None -> ""];
+  questionMode = iQuestionModeWire[OptionValue["QuestionMode"]];
+  interruptWords = Replace[OptionValue["InterruptWords"], Automatic | None -> {}];
+  If[!StringQ[model] || StringTrim[model] === "",
+    Return[iFailure["InvalidModel", "\"Model\" must be a model name such as \"gpt-live-1\"."]]];
+  If[!MemberQ[{"auto", "realtime", "live"}, api],
+    Return[iFailure["InvalidAPI", "\"API\" must be Automatic, \"Realtime\" or \"Live\"."]]];
+  If[!StringQ[liveBackendModel],
+    Return[iFailure["InvalidLiveBackendModel", "\"LiveBackendModel\" must be a model name."]]];
+  If[questionMode === $Failed,
+    Return[iFailure["InvalidQuestionMode",
+      "\"QuestionMode\" must be \"QuestionTime\", \"Keywords\" or \"Detect\"."]]];
+  If[!VectorQ[interruptWords, StringQ],
+    Return[iFailure["InvalidInterruptWords", "\"InterruptWords\" must be a list of strings."]]];
   voice = OptionValue["Voice"];
   instructions = OptionValue["Instructions"];
   inputSource = OptionValue["InputSource"];
@@ -993,6 +1087,8 @@ VRCRealtimeStart[OptionsPattern[]] := Module[
       "--state-file", stateFile,
       "--control-file", controlFile,
       "--model", model,
+      "--api", api,
+      "--question-mode", questionMode,
       "--voice", voice,
       "--input-source", ToLowerCase[inputSource],
       "--output-device", outputDevice,
@@ -1008,6 +1104,11 @@ VRCRealtimeStart[OptionsPattern[]] := Module[
       {"--input-device", inputDevice},
       {}
     ],
+    If[StringLength[liveBackendModel] > 0,
+      {"--live-backend-model", liveBackendModel}, {}],
+    If[interruptWords =!= {},
+      {"--interrupt-words", StringRiffle[StringTrim /@ interruptWords, ","]}, {}],
+    If[TrueQ[OptionValue["FullDuplex"]], {}, {"--no-live-full-duplex"}],
     If[StringLength[safetyIdentifier] > 0,
       {"--safety-identifier", safetyIdentifier},
       {}
@@ -1175,6 +1276,11 @@ VRCRealtimeStart[OptionsPattern[]] := Module[
     "StateFile" -> stateFile,
     "ControlFile" -> controlFile,
     "Model" -> model,
+    "API" -> If[api === "auto",
+      If[StringStartsQ[ToLowerCase[model], "gpt-live"], "Live", "Realtime"],
+      Capitalize[api]],
+    "LiveBackendModel" -> Replace[liveBackendModel, "" -> Automatic],
+    "QuestionMode" -> iQuestionModeName[questionMode],
     "Voice" -> voice,
     "InputSource" -> inputSource,
     "InputDevice" -> Replace[inputDevice, "" -> Automatic],
@@ -1240,9 +1346,12 @@ VRCRealtimeStatus[] := Module[{state, processStatus, diagnostics, lock, adopted}
     diagnostics,
     If[adopted =!= None, <|"AdoptedWorkerPID" -> adopted|>, <||>],
     If[AssociationQ[$iSession],
-      KeyTake[$iSession, {"Model", "Voice", "OutputDevice", "StartedAt"}],
+      KeyTake[$iSession, {"Model", "API", "Voice", "OutputDevice", "StartedAt"}],
       <||>
-    ]
+    ],
+    (* 質問モードはワーカーが持つ現在値 (音声で切り替わる) を正とする *)
+    If[AssociationQ[state] && StringQ[Lookup[state, "questionMode", Null]],
+      <|"QuestionMode" -> iQuestionModeName[state["questionMode"]]|>, <||>]
   ]
 ];
 
@@ -1436,7 +1545,7 @@ Options[VRCRealtimeStartPresentation] = {
   "SecondsPerSlide" -> Automatic,
   "ConsoleTimeoutSeconds" -> 30.,
   "NavigateToConsole" -> Automatic,
-  "NavigationTimeoutSeconds" -> 120.,
+  "NavigationTimeoutSeconds" -> 180.,
   "DownloadTimeoutSeconds" -> 120.,
   "MaxDownloadMegabytes" -> 256.,
   "StartSlide" -> Automatic,
@@ -1447,7 +1556,12 @@ Options[VRCRealtimeStartPresentation] = {
   (* スライド切り替え時に開く質疑応答の秒数。0 で質疑応答なし *)
   "QuestionSeconds" -> 5.,
   (* 全スライド終了後の質疑応答の上限秒数 (無音でこの時間が過ぎたら終了) *)
-  "FinalQuestionSeconds" -> 120.
+  "FinalQuestionSeconds" -> 120.,
+  (* この発表の質問の受け方。Automatic はワーカーの現在値 (VRCRealtimeStart の
+     "QuestionMode" / VRCRealtimeSetQuestionMode / 音声での切り替え) のまま。
+     スライド区切りの質疑 (QuestionSeconds) はどのモードでも開く。Keywords / Detect
+     はそれに加えて、スライドの途中でも割り込めるようにするもの。 *)
+  "QuestionMode" -> Automatic
 };
 
 (* 引数は Sliden 用 mp4 の URL、または登録済みの発表タイトル
@@ -1457,8 +1571,13 @@ VRCRealtimeStartPresentation[
     OptionsPattern[]] := Module[
   {value, urlGiven, spec, url, title, seconds, consoleTimeout, navigate, mcpService,
    navigationTimeout, downloadTimeout, maxMB, start, end, narration, talk,
-   questionSeconds, finalQuestionSeconds, result},
+   questionSeconds, finalQuestionSeconds, questionMode, result},
   value = StringTrim[target];
+  questionMode = Replace[OptionValue["QuestionMode"],
+    m : Except[Automatic] :> iQuestionModeWire[m]];
+  If[questionMode === $Failed,
+    Return[iFailure["InvalidQuestionMode",
+      "\"QuestionMode\" must be Automatic, \"QuestionTime\", \"Keywords\" or \"Detect\"."]]];
   urlGiven = AnyTrue[{"http://", "https://"}, StringStartsQ[value, #] &];
   (* 登録簿は MCP サービス越しに引く。止まっていると照合が timeout して原稿だけ
      静かに落ちるので、先に確保しておく (止まっていれば報告して起動を試みる)。 *)
@@ -1564,7 +1683,8 @@ VRCRealtimeStartPresentation[
     (* 原稿の無い発表を聞いたときに、未登録なのか原稿未作成なのかを後から
        区別できるようにする *)
     "catalogRoute" -> If[AssociationQ[spec] && TrueQ[Lookup[spec, "found", False]],
-      "registry", "direct"]
+      "registry", "direct"],
+    "questionMode" -> Replace[questionMode, Automatic -> Null]
   |>];
   If[AssociationQ[result],
     $iSession["PresentationURL"] = url;
@@ -1588,10 +1708,35 @@ VRCRealtimePresentationStatus[] := Module[{state},
 VRCRealtimeStopPresentation[] :=
   iSendCommand[<|"command" -> "presentation-stop"|>];
 
+(* ResumeHere / ResumeBack は「質疑応答でスライドを動かしたあと、どこから
+   続けるか」への返事。ワーカー側の action 名は snake_case なので ToLowerCase
+   では作れない (ResumeHere -> resumehere)。明示的に対応表で写す。 *)
 VRCRealtimePresentationControl[
-    action : ("Pause" | "Resume" | "Stop")] :=
+    action : ("Pause" | "Resume" | "Stop" | "ResumeHere" | "ResumeBack")] :=
   iSendCommand[<|"command" -> "presentation-control",
-    "value" -> ToLowerCase[action]|>];
+    "value" -> Replace[action, {
+      "ResumeHere" -> "resume_here", "ResumeBack" -> "resume_back",
+      other_ :> ToLowerCase[other]}]|>];
+
+VRCRealtimeSetQuestionMode[mode_] := Module[{wire, result},
+  wire = iQuestionModeWire[mode];
+  If[wire === $Failed,
+    Return[iFailure["InvalidQuestionMode",
+      "質問モードは \"QuestionTime\" (質問タイム) / \"Keywords\" (特定ワード) / \"Detect\" (二段構え) のどれかです。",
+      <|"Given" -> mode|>]]];
+  result = iSendCommand[<|"command" -> "question-mode", "value" -> wire|>];
+  If[AssociationQ[result],
+    If[AssociationQ[$iSession], $iSession["QuestionMode"] = iQuestionModeName[wire]];
+    Append[result, "QuestionMode" -> iQuestionModeName[wire]],
+    result]
+];
+
+VRCRealtimeQuestionMode[] := Module[{state},
+  state = iReadState[];
+  If[AssociationQ[state] && StringQ[Lookup[state, "questionMode", Null]],
+    iQuestionModeName[state["questionMode"]],
+    Missing["NotRunning"]]
+];
 
 VRCRealtimeSetMode[
     mode : ("Standalone" | "OwnerFollow" | "Presentation")] := Module[{result},

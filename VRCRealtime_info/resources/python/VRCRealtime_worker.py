@@ -14,6 +14,7 @@ from collections.abc import Callable
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -38,7 +39,7 @@ from VRCRealtime_visual_gate import VisualAttentionGate
 from VRCRealtime_owner_follow import OwnerFollowController
 from VRCRealtime_owner_formation import FormationConfig, OwnerFormationController
 from VRCRealtime_ownerjoin import OwnerLocator
-from VRCRealtime_voice_commands import VoiceCommandSpotter
+from VRCRealtime_voice_commands import VoiceCommandSpotter, control_action, has_greeting
 from VRCRealtime_sliden import (
     SlidenCancelled,
     SlidenConsoleController,
@@ -80,7 +81,13 @@ def _presentation_catalog_entry(title: Any) -> dict[str, Any]:
     requested = _normalise_presentation_title(title)
     for catalogue_title, entry in PRESENTATION_CATALOG.items():
         key = _normalise_presentation_title(catalogue_title)
-        if requested == key or requested.startswith(key):
+        if requested == key:
+            return dict(entry)
+        # "計算と自然31のプレゼン" is the same talk; "計算と自然312" is not.
+        # The registry refuses candidates whose trailing number differs and
+        # this table has to refuse them too -- starting the wrong deck is
+        # worse than starting none.
+        if requested.startswith(key) and not requested[len(key) : len(key) + 1].isdigit():
             return dict(entry)
     raise ValueError(f"presentation title is not configured: {title}")
 
@@ -165,6 +172,180 @@ def _presentation_entry_from_deck(deck: dict[str, Any]) -> dict[str, Any]:
         "narrationInstructions": instructions if isinstance(instructions, str) else "",
         "talk": None if deck.get("talkWithheld") else _normalise_talk(deck.get("talk")),
     }
+
+
+#: How questions are taken during a talk (set_question_mode / --question-mode).
+#:   question_time -- only in the window at each slide boundary (the room is
+#:                    not heard while a slide is narrated);
+#:   keywords      -- also mid-slide, but only when a listener says an allowed
+#:                    word ("質問", "スライド", "プレゼン", "発表" -- the last
+#:                    three so "発表を中断して" is heard), spotted locally by Vosk;
+#:   detect        -- also mid-slide whenever a listener speaks; whether it was
+#:                    a question is then the model's call.
+#: VRChat's room audio never contains the avatar's own voice (it goes out
+#: through the virtual cable), so listening during narration needs no echo
+#: cancellation here.
+QUESTION_MODES = ("question_time", "keywords", "detect")
+QUESTION_MODE_LABELS = {
+    "question_time": "質問タイム",
+    "keywords": "特定ワード",
+    "detect": "二段構え",
+}
+DEFAULT_INTERRUPT_WORDS = ("質問", "スライド", "プレゼン", "発表")
+
+
+class _TalkInterrupted(Exception):
+    """A listener interrupted the slide being narrated (keywords / detect)."""
+
+    def __init__(self, kind: str, heard: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
+        self.heard = heard
+
+
+def normalise_question_mode(value: Any) -> str | None:
+    """Accept the canonical names, the palette's names and the Japanese labels."""
+
+    text = str(value or "").strip()
+    key = text.casefold().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "question_time": "question_time",
+        "questiontime": "question_time",
+        "質問タイム": "question_time",
+        "keywords": "keywords",
+        "keyword": "keywords",
+        "words": "keywords",
+        "特定ワード": "keywords",
+        "detect": "detect",
+        "二段構え": "detect",
+    }
+    return aliases.get(key) or aliases.get(text)
+
+
+def resume_text(script: str, spoken: str) -> str:
+    """The script from the sentence the talk was stopped in.
+
+    Measured by length on the spoken transcript (punctuation and spaces
+    ignored): the sentence the transcript reaches into is said again whole.
+    """
+
+    sentences = [part for part in _SENTENCE_BOUNDARY.split(script) if part.strip()]
+    if not sentences:
+        return script
+    strip = lambda text: len(_NON_SPOKEN.sub("", text))  # noqa: E731
+    said = strip(spoken)
+    done = 0
+    for index, sentence in enumerate(sentences):
+        length = strip(sentence)
+        if done + length > said * 1.02:
+            return "".join(sentences[index:])
+        done += length
+    return ""
+
+
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[。！？!?\n])")
+_NON_SPOKEN = re.compile(r"[\s、。，．,.！？!?「」『』（）()・…ー-]")
+
+
+_KANJI_DIGIT = {
+    "〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+_KANJI_NUMBER = re.compile(r"[〇零一二三四五六七八九十百]+")
+
+
+def _kanji_number(token: str) -> int | None:
+    """三十三 -> 33, 百二 -> 102, 三三 -> 33 (digit by digit)."""
+
+    if not token:
+        return None
+    if "十" not in token and "百" not in token:
+        digits = [_KANJI_DIGIT.get(ch) for ch in token]
+        if any(d is None for d in digits):
+            return None
+        return int("".join(str(d) for d in digits))
+    total = 0
+    for unit, scale in (("百", 100), ("十", 10)):
+        if unit in token:
+            head, token = token.split(unit, 1)
+            total += (_KANJI_DIGIT.get(head, 0) if head else 1) * scale
+    if token:
+        value = _KANJI_DIGIT.get(token)
+        if value is None:
+            return None
+        total += value
+    return total
+
+
+def spoken_numbers(text: str) -> list[int]:
+    """Numbers written in arabic digits (any width) or kanji numerals.
+
+    Single kanji 一 is skipped: it is 「一つ」「一度」 far more often than a
+    talk number."""
+
+    normal = unicodedata.normalize("NFKC", str(text))
+    found = [int(match) for match in re.findall(r"\d+", normal)]
+    for match in _KANJI_NUMBER.findall(normal):
+        if match == "一":
+            continue
+        value = _kanji_number(match)
+        if value is not None:
+            found.append(value)
+    return found
+
+
+_TRAILING_KANJI_NUMBER = re.compile(r"([〇零一二三四五六七八九十百]+)(回)?$")
+
+
+def normalise_title_numbers(title: str) -> str:
+    """「計算と自然三十三」 -> 「計算と自然33」 (a trailing kanji numeral only).
+
+    The registry tells talks apart by their trailing number, and does not
+    read kanji: 「計算と自然三十三」 tied with 31, 32 and 33 and the first
+    one, 31, was started (live 2026-09-19)."""
+
+    text = unicodedata.normalize("NFKC", str(title)).strip()
+    match = _TRAILING_KANJI_NUMBER.search(text)
+    if not match or match.group(1) == "一":
+        return text
+    value = _kanji_number(match.group(1))
+    if value is None:
+        return text
+    return text[: match.start()] + str(value) + (match.group(2) or "")
+
+
+def title_stem(title: str) -> str:
+    """The words of a talk title without its number: 「計算と自然33」 -> 「計算と自然」."""
+
+    text = unicodedata.normalize("NFKC", str(title))
+    text = re.sub(r"\d+|[〇零一二三四五六七八九十百]+(回)?$", "", text)
+    return re.sub(r"[\s、。,.・「」『』()（）]", "", text)
+
+
+_STOP_INTENT = re.compile(r"終了|中止|打ち切|おしまいに|終わりにし|終わらせ")
+_PAUSE_INTENT = re.compile(r"一時停止|停止|中断|止めて|止めてください|止まって|ちょっと待って")
+_RESUME_INTENT = re.compile(r"再開|続けて|続きを")
+_TALK_NAMED = re.compile(r"発表|プレゼン|スライド|説明")
+
+
+def presentation_control_intent(text: str) -> str | None:
+    """"stop" / "pause" / "resume" when an utterance asks that of the talk.
+
+    Used on GPT-Live's input transcript: its model answered 「発表を終了
+    します」 to 「発表を終了してください」 and never called the tool, three
+    times (live 2026-09-19).  Questions (「何時に終了しますか」) are not
+    requests.  「やめて」 counts only with the talk named."""
+
+    t = re.sub(r"\s", "", unicodedata.normalize("NFKC", str(text)))
+    if not t or re.search(r"[?？]$|か[。.!！]*$", t):
+        return None
+    if _STOP_INTENT.search(t) or (_TALK_NAMED.search(t) and re.search(r"やめて|やめよう", t)):
+        return "stop"
+    if _PAUSE_INTENT.search(t):
+        return "pause"
+    if _RESUME_INTENT.search(t):
+        return "resume"
+    return None
 
 
 def _clear_queue(q: queue.Queue[Any]) -> None:
@@ -355,6 +536,9 @@ class _SourceVaultHandled(Exception):
 
 
 class RealtimeBridge:
+    #: Which OpenAI API this bridge speaks ("live" in VRCRealtime_live).
+    API = "realtime"
+
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -404,9 +588,16 @@ class RealtimeBridge:
         self.inflight_response_request: dict[str, Any] | None = None
         self.current_output_purpose = "normal"
         self.presentation_thread: threading.Thread | None = None
+        #: The most recent avatar tool-call batch, kept so shutdown and tests
+        #: can wait for it instead of racing it.
+        self.avatar_command_thread: threading.Thread | None = None
         self.presentation_audio_done: queue.Queue[str] = queue.Queue()
         #: Question window between slides.  The mic is opened only while this
         #: is set, so a stray remark during narration cannot become a turn.
+        #: Wall-clock of the last input audio the server VAD committed as a
+        #: conversation item.  With automatic responses off during a talk,
+        #: this is what says the question is there to be answered.
+        self.input_committed_at = 0.0
         self.presentation_qa_open = threading.Event()
         self.presentation_qa_speech = threading.Event()
         self.presentation_qa_done: queue.Queue[str] = queue.Queue()
@@ -429,6 +620,43 @@ class RealtimeBridge:
         self.console_slide = 0
         self.presentation_controller: Any = None
         self.presentation_talk: dict[str, Any] | None = None
+        #: How questions are taken during a talk (QUESTION_MODES).  Changed by
+        #: voice (set_question_mode), by the notebook ("question-mode") or by a
+        #: presentation-start command that names one.
+        self.question_mode = (
+            normalise_question_mode(getattr(args, "question_mode", "question_time"))
+            or "question_time"
+        )
+        raw_words = getattr(args, "interrupt_words", "") or ""
+        words = raw_words.split(",") if isinstance(raw_words, str) else list(raw_words)
+        self.interrupt_words = [
+            " ".join(str(word).split()) for word in words if str(word).strip()
+        ] or list(DEFAULT_INTERRUPT_WORDS)
+        #: A listener interrupted the slide being narrated: {"kind", "heard"}.
+        self.talk_interrupt_lock = threading.Lock()
+        self.talk_interrupt: dict[str, Any] | None = None
+        self.talk_interrupts = 0
+        #: Only while a slide or a segment is being narrated do keywords /
+        #: detect listen for interruptions.
+        self.presentation_narrating = threading.Event()
+        #: detect: how long the room has been loud (seconds of audio), and
+        #: the quiet that ends a stretch.
+        self._detect_loud_seconds = 0.0
+        self._detect_quiet_seconds = 0.0
+        #: No new interruption before this (monotonic): a room that is still
+        #: chatting after its question must not stop the talk every sentence.
+        self.talk_interrupt_quiet_until = 0.0
+        #: The last few seconds of room audio heard during narration.  The
+        #: utterance that interrupted ("スライドを戻して", a question) is in
+        #: it, and the model has to hear that, not only what follows.
+        self.talk_preroll: deque[NDArray[np.float32]] = deque(
+            maxlen=max(1, int(6000 / max(1, int(getattr(args, "chunk_ms", 20)))))
+        )
+        #: Output samples received per item: with played_samples this says
+        #: how much of a narration the room actually heard before a cut.
+        self.received_samples: dict[str, int] = {}
+        #: Did the model say anything in the last question window?
+        self.question_window_spoke = False
 
         # Input must never accumulate stale audio.  At 20 ms per event this
         # queue contains at most about 200 ms before dropping the oldest chunk.
@@ -456,10 +684,21 @@ class RealtimeBridge:
         self.input_blocked_until = 0.0
         self.instructions = args.instructions
         self.session_started_at = 0.0
+        #: HTTP status of a refused WebSocket handshake (set by _on_error).
+        self._handshake_status: int | None = None
+        #: Slide images of the running talk (GPT-Live prepares scripts for
+        #: unscripted slides ahead of narrating them).
+        self.presentation_slides: list[Path] = []
         self.state: dict[str, Any] = {
             "status": "starting",
             "connected": False,
             "pid": os.getpid(),
+            "api": self.API,
+            "questionMode": self.question_mode,
+            "questionModeLabel": QUESTION_MODE_LABELS[self.question_mode],
+            "interruptWords": list(self.interrupt_words),
+            "talkInterrupts": 0,
+            "lastTalkInterrupt": None,
             "model": args.model,
             "voice": args.voice,
             "outputDevice": args.output_device,
@@ -637,7 +876,13 @@ class RealtimeBridge:
             "presentationConsoleNavFit": None,
             "presentationConsoleStepBacks": 0,
             "presentationConsoleSlide": 0,
+            "presentationResumeNarrating": None,
+            "presentationResumeDisplayed": None,
+            "presentationResumeChoice": None,
             "presentationQAOpen": False,
+            "presentationQuestionGate": None,
+            "presentationLastQuestionHeard": None,
+            "presentationQuestionUncommitted": False,
             "presentationQuestionsAnswered": 0,
             "presentationPaused": False,
             "presentationLastControl": None,
@@ -692,6 +937,15 @@ class RealtimeBridge:
             "startedAt": time.time(),
             "updatedAt": time.time(),
         }
+        #: Room-audio capture health.  vrcpilot's SpeakerLoop ends its thread
+        #: on the first exception -- from the capture or from our callback --
+        #: and says so only when stopped: the room went silent for good and
+        #: 「会話に参加して」 was never heard (live 2026-09-19).
+        self.speaker_chunks = 0
+        self.speaker_last_chunk_at = 0.0
+        self.speaker_callback_errors = 0
+        self.speaker_restarts = 0
+        self._speaker_error_logged_at = 0.0
         self._write_state()
         if args.visual_attention_gate:
             self.visual_gate = VisualAttentionGate(
@@ -779,6 +1033,7 @@ class RealtimeBridge:
                 auto_download=not getattr(args, "no_voice_command_download", False),
                 min_confidence=float(getattr(args, "voice_command_min_confidence", 0.45)),
                 state_callback=self._set_state,
+                question_words=tuple(self.interrupt_words),
             )
 
     #: Publishing the state file competes with the notebook's Dynamic monitor,
@@ -1195,7 +1450,103 @@ class RealtimeBridge:
             pass
         self._increment_state("droppedInputChunks")
 
+    def _speaker_callback_safe(self, chunk: NDArray[np.float32]) -> None:
+        """What the SpeakerLoop calls: one bad chunk must not end the loop."""
+
+        self.speaker_chunks += 1
+        self.speaker_last_chunk_at = time.monotonic()
+        try:
+            self._speaker_callback(chunk)
+        except Exception as exc:  # keep hearing the room; say what broke
+            self.speaker_callback_errors += 1
+            now = time.monotonic()
+            if now - self._speaker_error_logged_at >= 5.0:
+                self._speaker_error_logged_at = now
+                import traceback
+
+                where = traceback.extract_tb(exc.__traceback__)[-1]
+                self._write_state(
+                    speakerCallbackErrors=self.speaker_callback_errors,
+                    lastSpeakerCallbackError=(
+                        f"{type(exc).__name__}: {exc} "
+                        f"({where.name}:{where.lineno})"
+                    )[:300],
+                )
+
+    def _start_speaker(self) -> None:
+        pid = self.args.vrchat_pid if self.args.vrchat_pid > 0 else None
+        self.speaker = SpeakerLoop(
+            self._speaker_callback_safe,
+            chunk_seconds=self.args.chunk_ms / 1000.0,
+            pid=pid,
+        )
+        self.speaker.start()
+        self.speaker_last_chunk_at = time.monotonic()
+
+    def _speaker_watchdog(self) -> None:
+        """Bring the room audio back when its capture thread has died or hung."""
+
+        while not self.stop_event.wait(2.0):
+            self._check_speaker()
+
+    def _check_speaker(self) -> bool:
+        """One watchdog look; True when the capture was restarted."""
+
+        speaker = self.speaker
+        if speaker is None:
+            return False
+        stale = time.monotonic() - self.speaker_last_chunk_at
+        alive = bool(getattr(speaker, "is_running", True))
+        self._set_state(
+            speakerAlive=alive,
+            speakerChunks=self.speaker_chunks,
+            speakerLastChunkAgeSeconds=round(stale, 1),
+        )
+        # The loop forwards empty chunks as silence ticks, so a quiet
+        # room still ticks: 10 s without one is a dead or hung capture.
+        if alive and stale < 10.0:
+            return False
+        reason = "thread_died" if not alive else f"no_audio_{stale:.0f}s"
+        error = getattr(speaker, "_exception", None)
+        # close() joins the capture thread with no timeout; a capture hung
+        # in read() would take the watchdog down with it.  Let it go on
+        # its own thread.
+        threading.Thread(
+            target=self._close_quietly, args=(speaker,), daemon=True
+        ).start()
+        self.speaker_restarts += 1
+        try:
+            self._start_speaker()
+            restarted = True
+        except Exception as exc:
+            restarted = False
+            error = error or exc
+        self._write_state(
+            speakerRestarts=self.speaker_restarts,
+            lastSpeakerRestart={
+                "reason": reason,
+                "error": (f"{type(error).__name__}: {error}"[:300] if error else None),
+                "restarted": restarted,
+                "at": time.time(),
+            },
+        )
+        return restarted
+
+    @staticmethod
+    def _close_quietly(speaker: Any) -> None:
+        try:
+            speaker.close()
+        except BaseException:
+            pass  # the error is already recorded; close() re-raises it
+
     def _speaker_callback(self, chunk: NDArray[np.float32]) -> None:
+        if self._control_listening() and chunk.size:
+            # A talk in keywords / detect mode listens to the room while it
+            # narrates.  Local only: the mic stays muted towards OpenAI, and
+            # the room audio has no echo of the avatar (its voice goes out
+            # through the virtual cable, VRChat does not play it back).
+            self._observe_talk_audio(chunk)
+            return
         if (
             self.stop_event.is_set()
             or self.muted.is_set()
@@ -1203,8 +1554,13 @@ class RealtimeBridge:
             or self.sourcevault_waiting.is_set()
             or self.local_handoff_active.is_set()
             or not self.ws_ready.is_set()
-            or (self.output_active.is_set() and not self.args.allow_barge_in)
-            or time.monotonic() < self.input_blocked_until
+            or (
+                not self._full_duplex()
+                and (
+                    (self.output_active.is_set() and not self.args.allow_barge_in)
+                    or time.monotonic() < self.input_blocked_until
+                )
+            )
             or chunk.size == 0
         ):
             return
@@ -1212,7 +1568,7 @@ class RealtimeBridge:
         spotter = self.voice_commands
         if (
             spotter is not None
-            and not self.output_active.is_set()
+            and (not self.output_active.is_set() or self._full_duplex())
             and not self.private_playback.is_set()
         ):
             # Local only.  The spotter never sees audio the bridge would not
@@ -1272,6 +1628,15 @@ class RealtimeBridge:
             return
 
         self._enqueue_input_audio(chunk)
+
+    def _full_duplex(self) -> bool:
+        """Does the room keep being heard while the avatar speaks?
+
+        Not with Realtime: its server VAD turns any sound in the room into
+        a barge-in, so the room is closed while the avatar speaks and for a
+        moment after.  The GPT-Live bridge answers differently."""
+
+        return False
 
     def _enqueue_input_audio(self, chunk: NDArray[np.float32]) -> None:
         """Downmix and enqueue one visual-gate-approved audio chunk."""
@@ -1637,7 +2002,8 @@ class RealtimeBridge:
         self.input_blocked_until = (
             time.monotonic() + self.args.output_cooldown_ms / 1000.0
         )
-        _clear_queue(self.input_events)
+        if not self._full_duplex():
+            _clear_queue(self.input_events)
         # Discard any echo tail already waiting on the server.
         self._send_now({"type": "input_audio_buffer.clear"})
         if was_private:
@@ -1659,6 +2025,11 @@ class RealtimeBridge:
                 pass
         elif self.presentation_qa_open.is_set():
             # An answer to a question asked inside the window finished playing.
+            # (detect lets the model stay silent when what it heard was not
+            # addressed to it; whether it spoke decides how the talk resumes.)
+            with self.state_lock:
+                if str(self.state.get("lastTranscript", "")).strip():
+                    self.question_window_spoke = True
             try:
                 self.presentation_qa_done.put_nowait(output_purpose)
             except queue.Full:
@@ -1747,8 +2118,12 @@ class RealtimeBridge:
             self.output_done.clear()
             if self.owner_follower is not None:
                 self.owner_follower.set_speech_active(True)
-            if not self.args.allow_barge_in:
+            if not self.args.allow_barge_in and not self._full_duplex():
                 _clear_queue(self.input_events)
+        with self.playback_lock:
+            self.received_samples[item_id] = (
+                self.received_samples.get(item_id, 0) + int(samples.size)
+            )
         for start in range(0, samples.size, PLAYBACK_SLICE_SAMPLES):
             part = samples[start : start + PLAYBACK_SLICE_SAMPLES].copy()
             try:
@@ -1810,9 +2185,11 @@ class RealtimeBridge:
             instructions += (
                 "\n利用者がスタンドアロン／フォロー／プレゼンモードへの切替を命じたら、"
                 "口頭で答えるだけでなく必ず set_avatar_mode を呼んでください。"
-                "『計算と自然集会31のプレゼンを開始して』のように発表名を挙げた依頼には、"
-                "モード切替だけでなく必ず start_presentation を呼び、title には利用者が"
-                "言った発表名をそのまま渡してください。登録簿の照合は tool 側が行うので、"
+                "『〇〇集会のプレゼンを開始して』のように発表名を挙げた依頼には、"
+                "start_presentation を一度だけ呼び、title には利用者が言った発表名を"
+                "そのまま渡してください (set_avatar_mode を先に呼ぶ必要はありません。"
+                "title 付きの set_avatar_mode で始めた場合も start_presentation を"
+                "重ねて呼ばないでください)。登録簿の照合は tool 側が行うので、"
                 "タイトルを自分で言い換えたり番号を推測したりしないでください。"
                 "ツールは登録簿からスライドURLと発表原稿を取得し、操作パネルへの投入と"
                 "発表開始までをバックグラウンドで実行します。"
@@ -1959,7 +2336,8 @@ class RealtimeBridge:
                             "またはプレゼンモードへ実際に切り替える。"
                             "mode=presentation はモードを変えるだけで発表は始まらない。"
                             "利用者が発表名を挙げて開始を求めたときは title に"
-                            "その発表名をそのまま入れること (入れれば発表も始まる)。"
+                            "その発表名をそのまま入れること (入れれば発表も始まるので、"
+                            "start_presentation を重ねて呼ばないこと)。"
                             "title が分からないときは start_presentation を使うこと。"
                         ),
                         "parameters": {
@@ -1977,7 +2355,8 @@ class RealtimeBridge:
                                     "type": "string",
                                     "description": (
                                         "mode=presentation のときだけ。利用者が言った"
-                                        "発表名をそのまま。例: 計算と自然集会31"
+                                        "発表名を番号も含めてそのまま (漢数字は算用数字に"
+                                        "してよい)。番号を推測・補完しないこと。"
                                     ),
                                 },
                             },
@@ -2001,8 +2380,9 @@ class RealtimeBridge:
                                 "title": {
                                     "type": "string",
                                     "description": (
-                                        "利用者が言った発表名をそのまま。"
-                                        "例: 計算と自然集会31"
+                                        "利用者が言った発表名を番号も含めてそのまま"
+                                        "(漢数字は算用数字にしてよい)。番号を推測・"
+                                        "補完しないこと。"
                                     ),
                                 }
                             },
@@ -2015,9 +2395,16 @@ class RealtimeBridge:
                         "name": "presentation_control",
                         "description": (
                             "実行中の発表を一時停止・再開・停止する。"
-                            "『一時停止して』『ちょっと待って』は pause、"
+                            "『一時停止して』『ちょっと待って』『中断して』"
+                            "『停止して』『止めて』は pause、"
                             "『再開して』『続けて』は resume、"
-                            "『打ち切って』『発表を終了』『もうやめて』は stop。"
+                            "『発表を終了して』『打ち切って』『もうやめて』は stop。"
+                            "終了は取り消せないので、迷うときは pause にする。"
+                            "質疑応答中にスライドを動かすと、発表側から"
+                            "『表示中のスライドから続けますか、元の位置へ戻りますか』"
+                            "と尋ねる。その返事に答えるときだけ、"
+                            "表示中から続けるなら resume_here、"
+                            "発表が進んでいた位置へ戻るなら resume_back を使う。"
                             "口頭で答えるだけにせず必ずこのツールを呼ぶこと。"
                         ),
                         "parameters": {
@@ -2025,7 +2412,13 @@ class RealtimeBridge:
                             "properties": {
                                 "action": {
                                     "type": "string",
-                                    "enum": ["pause", "resume", "stop"],
+                                    "enum": [
+                                        "pause",
+                                        "resume",
+                                        "stop",
+                                        "resume_here",
+                                        "resume_back",
+                                    ],
                                 }
                             },
                             "required": ["action"],
@@ -2103,6 +2496,7 @@ class RealtimeBridge:
                     },
                 ]
             )
+        tools.append(self._question_mode_tool())
         if self._visual_session_enabled():
             tools.append(
                 {
@@ -2150,6 +2544,100 @@ class RealtimeBridge:
             "type": "session.update",
             "session": session,
         }
+
+    def _question_mode_tool(self) -> dict[str, Any]:
+        words = "」「".join(self.interrupt_words)
+        return {
+            "type": "function",
+            "name": "set_question_mode",
+            "description": (
+                "発表中の質問の受け方を切り替える。利用者が『質問モードを切り替えたい』"
+                "『質問の受け方を変えて』などと言ったら、まず次の3つを日本語でごく短く"
+                "説明し、どれにするか尋ねる。選ばれたらこのツールを呼ぶ。"
+                "question_time=質問タイム(スライドの区切りでだけ質問を受ける。既定)、"
+                f"keywords=特定ワード(発表中でも「{words}」を含む発話があれば中断して"
+                "質問を受け、終われば中断した所から再開)、"
+                "detect=二段構え(発表中に声が聞こえたら一旦止め、自分への質問か判断して"
+                "応じ、違えば続ける)。利用者がモード名を最初から言っていれば、"
+                "尋ね直さずに呼んでよい。現在のモードを尋ねられたら mode を省いて呼ぶ。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": list(QUESTION_MODES),
+                    }
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        }
+
+    def _handle_question_mode_call(self, item: dict[str, Any]) -> None:
+        call_id = str(item.get("call_id", ""))
+        try:
+            arguments = json.loads(str(item.get("arguments", "{}")) or "{}")
+        except json.JSONDecodeError:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        requested = arguments.get("mode")
+        previous = self.question_mode
+        if requested in (None, ""):
+            payload = {
+                "status": "current",
+                "mode": previous,
+                "label": QUESTION_MODE_LABELS[previous],
+            }
+            instructions = (
+                f"現在の質問モードは『{QUESTION_MODE_LABELS[previous]}』です。"
+                "日本語でごく短く伝えてください。"
+            )
+        else:
+            mode = normalise_question_mode(requested)
+            ready, why = self._question_mode_ready(mode or "")
+            if mode is None:
+                payload = {"status": "error", "error": f"unknown mode: {requested}"}
+                instructions = (
+                    "指定された質問モードは無効でした。質問タイム・特定ワード・"
+                    "二段構えのどれにするか、日本語で短く尋ね直してください。"
+                )
+            elif not ready:
+                payload = {
+                    "status": "unavailable",
+                    "mode": mode,
+                    "reason": why,
+                    "current": previous,
+                }
+                instructions = (
+                    f"『{QUESTION_MODE_LABELS[mode]}』は、音声のキーワード認識が"
+                    "準備できていないため今は使えません。現在の"
+                    f"『{QUESTION_MODE_LABELS[previous]}』のままであることを"
+                    "日本語でごく短く伝えてください。"
+                )
+            else:
+                self._set_question_mode(mode, source="voice")
+                payload = {
+                    "status": "changed" if mode != previous else "unchanged",
+                    "mode": mode,
+                    "label": QUESTION_MODE_LABELS[mode],
+                    "previous": previous,
+                    "presentationRunning": self._presentation_running(),
+                }
+                instructions = (
+                    f"質問モードを『{QUESTION_MODE_LABELS[mode]}』に"
+                    + ("しました。" if mode != previous else "したままです。")
+                    + "そのことを日本語でごく短く伝えてください。"
+                )
+                if mode == "keywords":
+                    instructions += (
+                        f"発表中に質問したいときは「{self.interrupt_words[0]}」と"
+                        "言ってもらえばよい、と一言添えてください。"
+                    )
+        self._send_function_output(call_id, payload)
+        self._write_state(lastVoiceCommand="set_question_mode", lastVoiceCommandValue=str(requested))
+        self._request_response(purpose="question_mode", instructions=instructions)
 
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
         with self.ws_lock:
@@ -2365,11 +2853,44 @@ class RealtimeBridge:
                 else:
                     registry_error = str(response.get("error", route or "unavailable"))
         self._write_state(presentationCatalogError=registry_error)
-        entry = _presentation_catalog_entry(title)
+        try:
+            entry = _presentation_catalog_entry(title)
+        except ValueError:
+            # The built-in table holds one talk.  Everything else lives in the
+            # registry, so a registry that could not answer is the reason this
+            # talk cannot start -- report that, in the language it will be
+            # spoken in, instead of "not configured" (live 2026-09-04: the
+            # service kernel was inside a 300 s maintenance tick, the lookup
+            # timed out, and the room was told a presentation was on its way).
+            if registry_error:
+                self._write_state(
+                    presentationLastError=f"registry unavailable: {registry_error}"
+                )
+                raise ValueError(
+                    f"発表登録簿を引けなかったため『{title}』を開始できません "
+                    f"({registry_error})。SourceVault サービスの応答を待って"
+                    "もう一度声をかけてもらってください。"
+                ) from None
+            self._write_state(presentationLastError=f"unknown title: {title}")
+            raise ValueError(
+                f"『{title}』という発表は登録簿にありません。"
+            ) from None
         entry.setdefault("talk", None)
         return entry, "builtin"
 
-    _PRESENTATION_CONTROL_ACTIONS = {"pause", "resume", "stop"}
+    _PRESENTATION_CONTROL_ACTIONS = {
+        "pause",
+        "resume",
+        "stop",
+        # Answers to "carry on from the slide on screen, or from the one the
+        # talk had reached?", asked whenever questions moved the deck.
+        "resume_here",
+        "resume_back",
+    }
+    #: How long that question waits for an answer before carrying on from
+    #: where the talk was.  Long enough to think about, short enough that a
+    #: room that has stopped listening does not strand the talk.
+    _RESUME_CHOICE_SECONDS = 25.0
 
     def _sliden_text_locator(self, frame: NDArray[np.uint8]) -> list[tuple[str, Any]]:
         """OCR every text on *frame*, for the navigation's wall-screen search.
@@ -2418,7 +2939,9 @@ class RealtimeBridge:
         console controller and the mute state half-restored."""
 
         if action not in self._PRESENTATION_CONTROL_ACTIONS:
-            raise ValueError("action must be pause, resume, or stop")
+            raise ValueError(
+                "action must be pause, resume, stop, resume_here or resume_back"
+            )
         with self.presentation_control_lock:
             self.presentation_control_request = action
         self._write_state(presentationLastControl=action)
@@ -2512,12 +3035,23 @@ class RealtimeBridge:
             return
         if self.console_slide <= 0:
             self.console_slide = 1
-        steps = target - self.console_slide
-        if steps == 0:
+        if target == self.console_slide:
             self._announce("slide_jump", f"スライド {target}", min_interval=0.0)
             return
         self._presentation_state(presentationPhase="showing_slide")
         self._announce("slide_jump", f"スライド {target} へ", min_interval=0.0)
+        self._move_console_to(controller, target)
+
+    def _move_console_to(self, controller: Any, target: int) -> None:
+        """Step the console to *target*.  Presentation thread only."""
+
+        if controller is None or target < 1:
+            return
+        if self.console_slide <= 0:
+            self.console_slide = 1
+        steps = target - self.console_slide
+        if steps == 0:
+            return
         move = controller.next_slide if steps > 0 else controller.previous_slide
         for _ in range(abs(steps)):
             if self._presentation_cancelled():
@@ -2529,6 +3063,545 @@ class RealtimeBridge:
             self.console_slide += 1 if steps > 0 else -1
             self._write_state(presentationConsoleSlide=self.console_slide)
         self._write_state(presentationConsoleSlide=self.console_slide)
+
+    def _resume_after_slide_detour(
+        self, controller: Any, narrating: int, run_id: str
+    ) -> int | None:
+        """Put the talk and the screen back in agreement after questions.
+
+        Questions are taken at a slide boundary and the room can move the deck
+        while they are open ("go back one, what was that?").  The narration
+        then carried straight on with the next slide's script over whatever
+        was left on screen, and the two never met again for the rest of the
+        run.  Which way to reconcile them is not this process's call: the room
+        may have moved back to re-read a slide it wants covered again, or
+        merely to glance at it.  So ask.
+
+        Returns the slide to narrate next when the room chose to carry on from
+        where the deck now stands, or None when the console was put back to
+        the slide the talk had reached -- in which case the caller advances as
+        it always did.
+        """
+
+        displayed = self.console_slide
+        if displayed <= 0 or displayed == narrating:
+            return None
+        choice = self._ask_presentation_resume_point(narrating, displayed, run_id)
+        # The deck may have moved again while the room was deciding; "here"
+        # means wherever it stands now, not where it stood when asked.
+        displayed = self.console_slide
+        if choice == "here" and displayed != narrating:
+            self._presentation_state(
+                presentationResumeChoice="displayed",
+                presentationCurrentSlide=displayed,
+            )
+            return displayed
+        self._presentation_state(presentationResumeChoice="narration")
+        self._move_console_to(controller, narrating)
+        return None
+
+    def _ask_presentation_resume_point(
+        self, narrating: int, displayed: int, run_id: str
+    ) -> str:
+        """Ask where to carry on from.  Returns "here" or "back"."""
+
+        self._presentation_state(
+            presentationPhase="awaiting_resume_choice",
+            presentationResumeNarrating=narrating,
+            presentationResumeDisplayed=displayed,
+            presentationResumeChoice=None,
+        )
+        self._announce(
+            f"presentation:resume:{run_id}",
+            f"{displayed}枚目から続けますか、{narrating}枚目へ戻りますか",
+            min_interval=0.0,
+        )
+        # The question is spoken from fixed text rather than left to the model:
+        # it has to name the right two slide numbers every time, and this
+        # process is the only thing that knows them.
+        self._speak_presentation_line(
+            f"presentation_resume_choice:{run_id}",
+            f"いま{displayed}枚目を表示しています。"
+            f"このまま{displayed}枚目から続けますか、"
+            f"それとも{narrating}枚目に戻って続けますか",
+        )
+        self._activate_visual_session("presentation_resume_choice")
+        # Same rule as the slide-boundary window: room noise must not be able
+        # to make the avatar talk.  The answer is a tool call, so the model
+        # only needs a turn once the room has actually said something.
+        gated = self._local_speech_gate_ready()
+        if gated:
+            self._send_vad_mode(False)
+            self.input_committed_at = 0.0
+        _clear_queue(self.presentation_qa_done)
+        self.presentation_qa_speech.clear()
+        self.presentation_qa_open.set()
+        self._send_now(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "いま発表の再開位置を尋ねたところです。"
+                                "返事を聞いたら必ず presentation_control を呼んでください。\n"
+                                f"1. 『このまま』『ここから』『{displayed}枚目から』など、"
+                                "表示中のスライドから続ける意味なら action=resume_here。\n"
+                                f"2. 『戻って』『元の場所から』『{narrating}枚目から』など、"
+                                "発表が進んでいた場所へ戻る意味なら action=resume_back。\n"
+                                "3. 『再開して』『続けて』だけのときは、利用者はいま画面に"
+                                "出ているスライドを見て言っているので resume_here。\n"
+                                "4. 『やめて』『終了』なら action=stop。\n"
+                                "余計な説明はせず、短く復唱してからツールを呼んでください。"
+                            ),
+                        }
+                    ],
+                },
+            }
+        )
+        self.muted.clear()
+        self._write_state(muted=False, presentationQAOpen=True)
+        try:
+            heard_since = time.time()
+            deadline = time.monotonic() + self._RESUME_CHOICE_SECONDS
+            while time.monotonic() < deadline:
+                if self._presentation_cancelled():
+                    return "back"
+                action = self._take_presentation_control()
+                if action == "resume_here":
+                    return "here"
+                if action == "resume_back":
+                    return "back"
+                if action == "stop":
+                    self._write_state(presentationStoppedBy="voice")
+                    raise SlidenCancelled("presentation was stopped by voice")
+                if action == "resume":
+                    # The model was told to disambiguate and did not.  Someone
+                    # looking at a slide who says "carry on" means this one.
+                    return "here"
+                if action == "pause":
+                    # Not an answer -- give the room more time rather than
+                    # deciding for it.
+                    deadline = time.monotonic() + self._RESUME_CHOICE_SECONDS
+                if gated and self._room_utterance_after(heard_since) is not None:
+                    # Somebody answered.  Give the model the one turn it needs
+                    # to hear them and call presentation_control.
+                    heard_since = time.time()
+                    self._answer_room_question()
+                self._serve_slide_request(self.presentation_controller)
+                if self.console_slide != displayed and self.console_slide > 0:
+                    # They moved the deck again; the question now stands about
+                    # the new slide, so do not run the clock out on the old one.
+                    displayed = self.console_slide
+                    self._presentation_state(presentationResumeDisplayed=displayed)
+                    deadline = time.monotonic() + self._RESUME_CHOICE_SECONDS
+                time.sleep(0.05)
+            # Nobody answered.  Carrying on from where the talk was is the
+            # choice that keeps the script and the screen together, which is
+            # the whole point of asking.
+            return "back"
+        finally:
+            self.presentation_qa_open.clear()
+            self.presentation_qa_speech.clear()
+            self.muted.set()
+            if gated and not (
+                self.privacy_muted.is_set()
+                or self.sourcevault_waiting.is_set()
+                or self.local_handoff_active.is_set()
+            ):
+                self._send_vad_mode(True)
+            self._write_state(muted=True, presentationQAOpen=False)
+
+    # ------------------------------------------------------------------
+    # Question modes: question_time / keywords / detect
+    # ------------------------------------------------------------------
+
+    def _set_question_mode(self, value: Any, *, source: str) -> str | None:
+        """Switch how the talk takes questions; None for an unknown mode."""
+
+        mode = normalise_question_mode(value)
+        if mode is None:
+            return None
+        self.question_mode = mode
+        self._write_state(
+            questionMode=mode,
+            questionModeLabel=QUESTION_MODE_LABELS[mode],
+            questionModeSource=source,
+            questionModeChangedAt=time.time(),
+        )
+        return mode
+
+    def _question_mode_ready(self, mode: str) -> tuple[bool, str]:
+        """Can *mode* actually work here?  (ok, reason)"""
+
+        if mode == "keywords" and not self._keyword_spotter_ready():
+            return False, "keyword_recognizer_not_ready"
+        return True, ""
+
+    def _effective_question_mode(self) -> str:
+        """The mode in force: one that cannot work falls back to question_time
+        rather than leaving a talk that nobody can interrupt *and* that never
+        pauses for questions."""
+
+        mode = self.question_mode
+        return mode if self._question_mode_ready(mode)[0] else "question_time"
+
+    def _talk_listening(self) -> bool:
+        """Is the room being listened to for interruptions right now?"""
+
+        return bool(
+            self.presentation_narrating.is_set()
+            and self._effective_question_mode() != "question_time"
+            and not self.presentation_qa_open.is_set()
+            and not self.stop_event.is_set()
+        )
+
+    def _control_listening(self) -> bool:
+        """Is the room listened to (locally) for 「発表を止めて」 right now?
+
+        In every question mode: stopping a talk is not a question, and in
+        question-time mode nobody could stop one mid-slide."""
+
+        return bool(
+            self.presentation_narrating.is_set()
+            and not self.presentation_qa_open.is_set()
+            and not self.stop_event.is_set()
+        )
+
+    def _keyword_interrupt_armed(self) -> bool:
+        return self.question_mode == "keywords" and self._talk_listening()
+
+    def _arm_talk_listening(self) -> None:
+        with self.talk_interrupt_lock:
+            self.talk_interrupt = None
+        self.talk_preroll.clear()
+        self._detect_loud_seconds = 0.0
+        self._detect_quiet_seconds = 0.0
+        self.presentation_narrating.set()
+
+    def _disarm_talk_listening(self) -> None:
+        self.presentation_narrating.clear()
+        with self.talk_interrupt_lock:
+            # An interruption that landed as the slide ended belongs to no
+            # narration; the next slide must not start by stopping.
+            self.talk_interrupt = None
+
+    def _observe_talk_audio(self, chunk: NDArray[np.float32]) -> None:
+        """Listen to the room during narration.  Nothing is sent anywhere."""
+
+        self.talk_preroll.append(np.asarray(chunk, dtype=np.float32).copy())
+        # The recogniser always listens (it also hears 「発表を止めて」);
+        # what it may interrupt for depends on the mode (_on_voice_keyword).
+        spotter = self.voice_commands
+        if spotter is not None:
+            spotter.feed(chunk)
+        if self._effective_question_mode() != "detect":
+            return
+        data = np.asarray(chunk, dtype=np.float32)
+        frames = int(data.shape[0]) if data.ndim else 0
+        if frames <= 0:
+            return
+        seconds = frames / float(VRCHAT_RATE)
+        level = float(np.sqrt(np.mean(np.square(data))))
+        if level >= float(getattr(self.args, "interrupt_rms", 0.02)):
+            self._detect_loud_seconds += seconds
+            self._detect_quiet_seconds = 0.0
+        else:
+            self._detect_quiet_seconds += seconds
+            # A breath between words is not the end of speaking.
+            if self._detect_quiet_seconds >= 0.3:
+                self._detect_loud_seconds = 0.0
+        needed = float(getattr(self.args, "interrupt_ms", 450)) / 1000.0
+        if self._detect_loud_seconds >= needed:
+            self._detect_loud_seconds = 0.0
+            self._request_talk_interrupt("detect", "")
+
+    def _request_talk_interrupt(self, kind: str, heard: str, *, force: bool = False) -> bool:
+        """Ask the narration in progress to stop for questions (or, with
+        *force*, for a pause asked by voice -- in any question mode)."""
+
+        if not (self._control_listening() if force else self._talk_listening()):
+            return False
+        if not force and time.monotonic() < self.talk_interrupt_quiet_until:
+            self._write_state(talkInterruptIgnored=f"{kind}:cooldown")
+            return False
+        with self.talk_interrupt_lock:
+            if self.talk_interrupt is not None:
+                return False
+            self.talk_interrupt = {"kind": kind, "heard": heard[:120], "at": time.time()}
+        self.talk_interrupts += 1
+        self._write_state(
+            talkInterrupts=self.talk_interrupts,
+            lastTalkInterrupt={"kind": kind, "heard": heard[:120], "at": time.time()},
+        )
+        return True
+
+    def _cut_presentation_audio(self) -> None:
+        """Stop the narration the room cut into and wait until it is quiet.
+
+        Waiting matters: a cancelled response still ends with response.done,
+        and the bookkeeping that follows clears the input buffer -- which
+        would throw away the utterance about to be replayed to the model."""
+
+        with self.response_request_lock:
+            self.response_create_requests = deque(
+                request
+                for request in self.response_create_requests
+                if not str(
+                    request.get("response", {})
+                    .get("metadata", {})
+                    .get("vrc_realtime_purpose", "")
+                ).startswith("presentation_")
+            )
+            if not self.response_create_requests:
+                self.response_create_pending.clear()
+        deadline = time.monotonic() + 4.0
+        last_cancel = 0.0
+        while time.monotonic() < deadline:
+            with self.output_purpose_lock:
+                purpose = self.current_output_purpose
+            in_progress = self.response_in_progress.is_set()
+            speaking = in_progress or self.output_active.is_set()
+            if (
+                speaking
+                and purpose.startswith("presentation_")
+                and time.monotonic() - last_cancel >= 0.5
+            ):
+                if in_progress:
+                    self._send_now({"type": "response.cancel"})
+                if self.output_active.is_set():
+                    self._interrupt_playback()
+                last_cancel = time.monotonic()
+            if not (
+                speaking
+                or self.response_create_inflight.is_set()
+                or self.output_done.is_set()
+            ):
+                break
+            time.sleep(0.05)
+        self._write_state(presentationPhase="interrupted")
+
+    def _spoken_so_far(self) -> str:
+        """Roughly what the room heard of the narration that was cut.
+
+        The transcript runs ahead of playback (it arrives with the audio,
+        faster than real time), so it is cut to the share of the received
+        audio that was actually played."""
+
+        with self.state_lock:
+            transcript = str(self.state.get("lastTranscript", ""))
+        with self.playback_lock:
+            item = self.last_item_id
+            played = self.played_samples.get(item, 0)
+            received = self.received_samples.get(item, 0)
+        if not transcript or received <= 0:
+            return transcript
+        share = max(0.0, min(1.0, played / received))
+        return transcript[: int(round(len(transcript) * share))]
+
+    def _send_talk_preroll(self) -> None:
+        """Replay the last seconds of room audio (the interrupting utterance)."""
+
+        chunks = list(self.talk_preroll)
+        self.talk_preroll.clear()
+        if not chunks:
+            return
+        frames = [
+            np.asarray(chunk, dtype=np.float32).reshape(len(chunk), -1)
+            for chunk in chunks
+            if len(chunk)
+        ]
+        if not frames:
+            return
+        channels = min(frame.shape[1] for frame in frames)
+        mono = np.concatenate([frame[:, :channels] for frame in frames]).mean(
+            axis=1, dtype=np.float32
+        )
+        if mono.size % 2:
+            mono = mono[:-1]
+        if mono.size == 0:
+            return
+        down = mono.reshape(-1, 2).mean(axis=1, dtype=np.float32)
+        pcm = (np.clip(down, -1.0, 1.0) * 32767.0).astype("<i2")
+        step = OPENAI_INPUT_RATE // 10
+        for start in range(0, pcm.size, step):
+            self._send_now(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(
+                        pcm[start : start + step].tobytes()
+                    ).decode("ascii"),
+                }
+            )
+        self._write_state(talkPrerollSeconds=round(pcm.size / OPENAI_INPUT_RATE, 2))
+
+    def _interrupt_rule(self, interrupt: _TalkInterrupted | None) -> str:
+        """The first rule of a question window opened by an interruption."""
+
+        if interrupt is None:
+            return ""
+        if interrupt.kind == "control":
+            return (
+                "0. 聴衆の依頼で発表を一時停止しました。最初に届く音声がその依頼です。"
+                "『了解です』とだけ言ってください。再開を求められたら presentation_control"
+                " を action=resume で、終了を求められたら action=stop で呼んでください。\n"
+            )
+        # The room was not being asked for questions: whatever interrupted
+        # the talk has already been said, and the model hears it first.
+        # 「はい、どうぞ」 then answers nothing -- it invites the listener to
+        # say again what they just said (live 2026-09-19: 「発表を停止して」
+        # got 「はい、どうぞ」 and, straight after, 「発表を終了します」).  The
+        # reply has to follow on from what was received: 「了解です」 when it
+        # is understood, 「もう一度」 when it is not.
+        replies = (
+            "内容はもう受け取っているので、『はい、どうぞ』と促し直さず、"
+            "受け取った内容に続けて次のとおり応じてください。\n"
+            "- 発表の一時停止・再開・終了やスライド移動などの依頼で、内容が分かったとき:"
+            "『了解です』とだけ言ってから presentation_control や show_slide を呼ぶ"
+            "(結果を伝えるときに『了解です』を繰り返さない)。\n"
+            "- 質問のとき: 前置きを付けずにそのまま答える。\n"
+            "- 質問してよいかを尋ねただけで中身がまだ無いとき(『質問いいですか』など)に"
+            "限り、『はい、どうぞ』とだけ言う。\n"
+        )
+        if interrupt.kind == "detect":
+            return (
+                "0. 発表の読み上げ中に部屋から声が聞こえたので、読み上げを止めました。"
+                "最初に届く音声がその発話です。独り言・雑談・物音など、あなた(発表者)"
+                "に向けたものでなければ、何も言わずに黙ってください。"
+                "あなたへの質問・依頼なら、" + replies
+                + "- あなたに向けた発話だが聞き取れない、または何を求めているか判断"
+                "できないとき:『すみません、もう一度お願いします』とだけ言う。\n"
+            )
+        words = "」「".join(self.interrupt_words)
+        return (
+            f"0. 発表の読み上げ中に聴衆が「{words}」を含む発話をしたので、"
+            "読み上げを止めました。最初に届く音声がその発話です。" + replies
+            + "- 聞き取れない、または何を求めているか判断できないとき:"
+            "『すみません、もう一度お願いします』とだけ言う。\n"
+        )
+
+    def _segment_speaker(
+        self, kind: str, script: str, run_id: str, seconds_hint: float
+    ) -> Callable[[str | None, str | None, str], None]:
+        """The speak callback for an opening / closing segment."""
+
+        def speak(text: str | None, phrase: str | None, _said: str) -> None:
+            if phrase is None:
+                self._narrate_presentation_segment(
+                    kind, text or script, run_id, seconds_hint
+                )
+            else:
+                self._narrate_presentation_segment(
+                    kind, text or script, run_id, seconds_hint, resume_phrase=phrase
+                )
+
+        return speak
+
+    def _slide_speaker(
+        self,
+        image: Path,
+        number: int,
+        count: int,
+        seconds: float,
+        narration_instructions: str,
+        run_id: str,
+    ) -> Callable[[str | None, str | None, str], None]:
+        """The speak callback for one slide."""
+
+        def speak(text: str | None, phrase: str | None, said: str) -> None:
+            if phrase is None:
+                self._narrate_presentation_slide(
+                    image, number, count, seconds, narration_instructions, run_id,
+                    script=text,
+                )
+            else:
+                self._narrate_presentation_slide(
+                    image, number, count, seconds, narration_instructions, run_id,
+                    script=text, resume_phrase=phrase, already_said=said,
+                )
+
+        return speak
+
+    _RESUME_PHRASE = "それでは、説明に戻ります"
+    _RESUME_PHRASE_SPOKEN = re.compile(r"^.{0,24}?戻ります[。、!！]?")
+
+    def _narrate_with_interruptions(
+        self,
+        run_id: str,
+        label: str,
+        speak: Callable[[str | None, str | None, str], None],
+        *,
+        script: str | None,
+        slide_number: int | None = None,
+    ) -> int | None:
+        """Narrate, taking questions whenever the room cuts in.
+
+        ``speak(text, resume_phrase, already_said)`` narrates *text* (the
+        script, or what is left of it after an interruption; None without a
+        script).  In question_time mode nothing listens, so this is one call.
+        After questions the talk carries on from the sentence it was stopped
+        in.  Returns the slide to carry on from when the questions moved the
+        deck and the room chose to stay there, else None.
+        """
+
+        remaining = script
+        already_said = ""
+        resume_phrase: str | None = None
+        rounds = 0
+        while True:
+            self._arm_talk_listening()
+            try:
+                speak(remaining, resume_phrase, already_said)
+                return None
+            except _TalkInterrupted as interrupted:
+                caught = interrupted
+                heard = self._spoken_so_far()
+            finally:
+                self._disarm_talk_listening()
+            rounds += 1
+            if resume_phrase:
+                heard = self._RESUME_PHRASE_SPOKEN.sub("", heard, count=1)
+            if remaining:
+                remaining = resume_text(remaining, heard)
+            else:
+                already_said = (already_said + heard)[-1200:]
+            console_before = self.console_slide
+            self._write_state(
+                presentationInterruptKind=caught.kind,
+                presentationInterruptHeard=caught.heard or None,
+                presentationInterruptSpoken=heard[-200:],
+                presentationInterruptRemainingChars=(
+                    len(remaining) if remaining is not None else None
+                ),
+            )
+            outcome = self._presentation_question_window(
+                run_id,
+                f"{label}:interrupt{rounds}",
+                float(getattr(self.args, "interrupt_resume_seconds", 4.0)),
+                interrupt=caught,
+            )
+            self.talk_interrupt_quiet_until = time.monotonic() + float(
+                getattr(self.args, "interrupt_cooldown_seconds", 8.0)
+            )
+            if outcome == "stop":
+                raise SlidenCancelled("presentation was stopped by voice")
+            controller = self.presentation_controller
+            if slide_number is not None:
+                moved = self._resume_after_slide_detour(
+                    controller, slide_number, run_id
+                )
+                if moved is not None:
+                    return moved
+            elif console_before > 0 and self.console_slide != console_before:
+                self._move_console_to(controller, console_before)
+            if script and not (remaining or "").strip():
+                # Cut in the last breath of the slide: nothing is left to say.
+                return None
+            resume_phrase = self._RESUME_PHRASE if self.question_window_spoke else ""
+            self._presentation_state(presentationPhase="narrating")
 
     def _presentation_cancelled(self) -> bool:
         return self.stop_event.is_set() or self.presentation_stop_event.is_set()
@@ -2562,21 +3635,36 @@ class RealtimeBridge:
         *,
         final: bool = False,
         hard_cap_seconds: float | None = None,
+        interrupt: _TalkInterrupted | None = None,
     ) -> str:
         """Open the mic for questions.  Returns "continue" or "stop".
 
         The window is the only point in a presentation where the room can speak
         to the bot, so it is also where pause/stop/resume are heard.  It closes
         the mic again on every exit path -- an open mic during narration makes
-        the bot answer its own voice."""
+        the bot answer its own voice.
+
+        *interrupt* is set when the room cut into a slide (question modes
+        keywords / detect): the utterance that did it is replayed to the model
+        first, and no "それでは再開します" is said on the way out -- the
+        resumed narration says it."""
 
         if seconds <= 0.0:
             return "continue"
-        phase = "final_questions" if final else "question_window"
+        phase = (
+            "final_questions" if final
+            else "interrupt_questions" if interrupt is not None
+            else "question_window"
+        )
         answered = 0
         paused = False
+        self.question_window_spoke = False
         self._presentation_state(presentationPhase=phase)
-        self._announce(f"presentation:qa:{label}", "質問があればどうぞ", min_interval=0.0)
+        self._announce(
+            f"presentation:qa:{label}",
+            "質問をどうぞ" if interrupt is not None else "質問があればどうぞ",
+            min_interval=0.0,
+        )
         # The strict nameplate/mouth gate is meant for starting a conversation
         # from across a room; during a talk the audience is not framed that way.
         self._activate_visual_session("presentation_question_window")
@@ -2593,7 +3681,8 @@ class RealtimeBridge:
                         {
                             "type": "input_text",
                             "text": (
-                                "ここから短い質疑応答です。次の規則を守ってください。\n"
+                                self._interrupt_rule(interrupt)
+                                + "ここから短い質疑応答です。次の規則を守ってください。\n"
                                 "1. 質問には簡潔に、日本語で答える。長広舌にしない。\n"
                                 "2. 発表資料や保存資料に関する事実を問われたら、"
                                 "推測で答えず必ず sourcevault_lookup を先に呼ぶ"
@@ -2604,19 +3693,63 @@ class RealtimeBridge:
                                     else "そこで見つからなければ、分からないと正直に言う。"
                                 )
                                 + "\n"
-                                "3. 『一時停止して』『中断して』は presentation_control を "
-                                "action=pause で、『打ち切って』『発表を終了』『やめて』は "
-                                "action=stop で、『再開して』は action=resume で呼ぶ。\n"
-                                "4. 質問が無ければ何も話さないでください。"
+                                "3. 『一時停止して』『中断して』『停止して』『止めて』は "
+                                "presentation_control を action=pause で、"
+                                "『発表を終了して』『打ち切って』『もうやめて』は "
+                                "action=stop で、『再開して』は action=resume で呼ぶ。"
+                                "終了か一時停止か迷うときは pause にする。\n"
+                                "3b. スライドを動かしたあとで再開位置を尋ねられたら、"
+                                "表示中のスライドから続けるなら action=resume_here、"
+                                "発表が進んでいた位置へ戻るなら action=resume_back。\n"
+                                "4. この質疑応答の時間に誰も何も言わなければ、"
+                                "何も話さずに待ってください。"
+                                "『質問はありますか』と自分から尋ねてはいけません。"
+                                "この決まりは質疑応答の時間が終われば解除されます。"
                             ),
                         }
                     ],
                 },
             }
         )
+        # Nothing the avatar says at a slide boundary was asked for.  The
+        # server VAD was creating responses on its own, so any energy in the
+        # room -- world ambience, a footstep, a breath -- became a turn, and
+        # the model, primed by the rules just sent, filled that turn with
+        # 「何か質問はありますか」 and then 「それでは再開します」.  Live
+        # 2026-09-05: the talk interrupted and restarted itself repeatedly
+        # while nobody had said a word.  A threshold cannot fix that -- even a
+        # perfectly tuned one lets a cough become a question -- because the
+        # decision was being made on energy alone.  So automatic responses go
+        # off for the whole window, and the one thing that can create a turn
+        # is the local recogniser putting words to what it heard.
+        # The gate needs a recogniser that is actually running.  Without one
+        # there is no local way to tell a question from a noise, so the old
+        # VAD behaviour stays rather than the talk going deaf -- and which of
+        # the two is in force is reported, not left to be guessed at.
+        gated = self._local_speech_gate_ready()
+        if gated:
+            self._send_vad_mode(False)
+            self.input_committed_at = 0.0
+        self._write_state(presentationQuestionGate="local_speech" if gated else "vad")
+        if interrupt is not None:
+            # The utterance that stopped the talk goes first: "スライドを
+            # 戻して" has to be acted on, not asked for again.
+            self.input_committed_at = 0.0
+            self._send_talk_preroll()
         self.muted.clear()
         self._write_state(muted=False, presentationQAOpen=True)
         try:
+            if interrupt is not None and gated:
+                # Automatic responses are off; the replayed utterance is the
+                # turn this window was opened for.  detect waits longer: the
+                # speaker may still be mid-sentence.
+                if self._answer_room_question(
+                    settle_seconds=10.0 if interrupt.kind == "detect" else 4.0
+                ):
+                    answered += 1
+                    self._write_state(presentationQuestionsAnswered=answered)
+            # Only utterances from now on are this window's business.
+            heard_since = time.time()
             deadline = time.monotonic() + seconds
             # A pause nobody lifts, or an endless run of questions, must not
             # hold a presentation open forever; the room may simply have left.
@@ -2645,7 +3778,23 @@ class RealtimeBridge:
                     self._write_state(presentationPaused=False)
                     deadline = time.monotonic() + seconds
                 self._serve_slide_request(self.presentation_controller)
-                if self.presentation_qa_speech.is_set():
+                if gated:
+                    heard = self._room_utterance_after(heard_since)
+                    # A VAD onset on its own says only that the room made a
+                    # sound.  Clear it either way: unanswered, it must not
+                    # leak into the next window.  And fall through to the
+                    # deadline below when nothing was said -- a window that
+                    # only ever "continue"s never expires and never sleeps.
+                    self.presentation_qa_speech.clear()
+                    if heard is not None:
+                        heard_since = time.time()
+                        self._write_state(presentationLastQuestionHeard=heard[:120])
+                        if self._answer_room_question():
+                            answered += 1
+                            self._write_state(presentationQuestionsAnswered=answered)
+                            deadline = time.monotonic() + seconds
+                        continue
+                elif self.presentation_qa_speech.is_set():
                     self.presentation_qa_speech.clear()
                     # A tool-assisted answer can legitimately take a while; the
                     # window must not close under the answer it is waiting for.
@@ -2661,35 +3810,23 @@ class RealtimeBridge:
             self.presentation_qa_open.clear()
             self.presentation_qa_speech.clear()
             self.muted.set()
+            if gated and not (
+                self.privacy_muted.is_set()
+                or self.sourcevault_waiting.is_set()
+                or self.local_handoff_active.is_set()
+            ):
+                self._send_vad_mode(True)
             self._write_state(
                 muted=True, presentationQAOpen=False, presentationPaused=False
             )
             if not final:
-                # Close the question context explicitly.  The rules item above
-                # ends with "say nothing if there is no question", and left as
-                # the last thing said to the model it silences the next slide:
-                # slide 2 was skipped in silence and the talk ran on to the
-                # closing (observed 2026-08-15).
-                self._send_now(
-                    {
-                        "type": "conversation.item.create",
-                        "item": {
-                            "type": "message",
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": (
-                                        "質疑応答はここまでです。直前の質疑応答の規則は"
-                                        "もう適用されません。ここから発表の続きに戻ります。"
-                                        "次に渡されるスライドと原稿は必ず発話してください。"
-                                    ),
-                                }
-                            ],
-                        },
-                    }
-                )
-            if answered > 0 and not self._presentation_cancelled() and not final:
+                self._end_question_context()
+            if (
+                answered > 0
+                and not self._presentation_cancelled()
+                and not final
+                and interrupt is None
+            ):
                 # Never let the transition line change the window's outcome:
                 # raising out of a finally block would swallow the return value.
                 try:
@@ -2698,6 +3835,110 @@ class RealtimeBridge:
                     )
                 except (SlidenCancelled, SlidenError):
                     pass
+
+    #: Characters of recognised speech, ignoring out-of-vocabulary tokens,
+    #: below which an utterance is treated as noise rather than a question.
+    #: One stray syllable off a footstep is not somebody asking something.
+    _QUESTION_MINIMUM_CHARACTERS = 2
+
+    def _end_question_context(self) -> None:
+        """Close the question context explicitly, without a word to the room.
+
+        The rules item of a window ends with "say nothing if there is no
+        question", and left as the last thing said to the model it silences
+        the next slide: slide 2 was skipped in silence and the talk ran on to
+        the closing (observed 2026-08-15).  A Realtime conversation item is
+        never spoken by itself; the GPT-Live bridge overrides this, because
+        there the note was answered aloud (「質問時間は終わりました」 after
+        every slide, live 2026-09-19).
+        """
+
+        self._send_now(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "質疑応答はここまでです。直前の質疑応答の規則は"
+                                "もう適用されません。ここから発表の続きに戻ります。"
+                                "次に渡されるスライドと原稿は必ず発話してください。"
+                                "この文には返事をせず、何も話さないでください。"
+                            ),
+                        }
+                    ],
+                },
+            }
+        )
+
+    def _keyword_spotter_ready(self) -> bool:
+        """Is the local (Vosk) recogniser running?"""
+
+        listener = self.voice_commands
+        if listener is None:
+            return False
+        ready = getattr(listener, "ready", None)
+        return bool(ready is not None and ready.is_set())
+
+    def _local_speech_gate_ready(self) -> bool:
+        """Can this process tell speech from noise without asking OpenAI?
+
+        (GPT-Live answers only what it judges to be addressed to it and has
+        no automatic-response switch, so its bridge does not gate.)"""
+
+        return self._keyword_spotter_ready()
+
+    def _room_utterance_after(self, since: float) -> str | None:
+        """What the local recogniser heard since *since*, if it was words.
+
+        The server VAD fires on energy; it cannot tell a question from a door
+        closing.  The Vosk recogniser already running for the join/leave
+        keywords transcribes the same audio locally, and an utterance it can
+        put words to is the evidence that somebody actually said something.
+        """
+
+        listener = self.voice_commands
+        if listener is None:
+            return None
+        heard_at = float(getattr(listener, "last_text_at", 0.0) or 0.0)
+        if heard_at <= since:
+            return None
+        text = str(getattr(listener, "last_text", "") or "")
+        # "[unk]" is Vosk saying it heard *something* it has no word for --
+        # exactly what noise produces, so it cannot count towards the length.
+        words = "".join(
+            part for part in text.replace("[unk]", " ").split() if part
+        )
+        if len(words) < self._QUESTION_MINIMUM_CHARACTERS:
+            return None
+        return text.strip()
+
+    def _answer_room_question(self, settle_seconds: float = 2.5) -> bool:
+        """Turn the utterance the room just made into an answered turn.
+
+        Automatic responses are off for the whole window, so nothing has been
+        said back yet; the audio itself is already on its way to OpenAI, which
+        commits it as an input item.  Wait for that commit, then ask for the
+        one response this question is owed.  False when the audio never
+        arrived -- there is then nothing to answer and nothing to say.
+        """
+
+        deadline = time.monotonic() + settle_seconds
+        while self.input_committed_at <= 0.0:
+            if self._presentation_cancelled():
+                return False
+            if time.monotonic() >= deadline:
+                self._write_state(presentationQuestionUncommitted=True)
+                return False
+            time.sleep(0.05)
+        self.input_committed_at = 0.0
+        _clear_queue(self.presentation_qa_done)
+        self._request_response(purpose="question_answer")
+        self._wait_for_answer(180.0)
+        return True
 
     def _wait_for_answer(self, budget_seconds: float) -> None:
         """Wait until the answer to a question has finished playing."""
@@ -2743,11 +3984,22 @@ class RealtimeBridge:
         ).decode("ascii")
         return data_uri, output_width, output_height
 
-    def _await_presentation_audio(self, purpose: str, budget_seconds: float) -> None:
+    def _await_presentation_audio(
+        self, purpose: str, budget_seconds: float, *, interruptible: bool = False
+    ) -> None:
         deadline = time.monotonic() + budget_seconds
         while time.monotonic() < deadline:
             if self._presentation_cancelled():
                 raise SlidenCancelled("presentation was cancelled")
+            if interruptible:
+                with self.talk_interrupt_lock:
+                    interrupt = self.talk_interrupt
+                    self.talk_interrupt = None
+                if interrupt is not None:
+                    self._cut_presentation_audio()
+                    raise _TalkInterrupted(
+                        str(interrupt.get("kind", "")), str(interrupt.get("heard", ""))
+                    )
             try:
                 completed = self.presentation_audio_done.get(timeout=0.2)
             except queue.Empty:
@@ -2760,15 +4012,26 @@ class RealtimeBridge:
         raise SlidenError(f"timed out waiting for narration ({purpose})")
 
     def _narrate_presentation_segment(
-        self, kind: str, text: str, run_id: str, seconds_hint: float
+        self,
+        kind: str,
+        text: str,
+        run_id: str,
+        seconds_hint: float,
+        *,
+        resume_phrase: str | None = None,
     ) -> None:
         """Speak the opening or the closing -- the parts of a talk that belong
         to no single slide.  Without these the deck is a sequence of slide
         descriptions rather than a presentation, which is the whole point of
-        carrying a scenario."""
+        carrying a scenario.
+
+        *resume_phrase* is not None when a question interrupted the segment:
+        *text* is then what is left of it, and the phrase (possibly empty) is
+        said first."""
 
         self._ensure_vrchat_microphone_live()
         purpose = f"presentation_{kind}:{run_id}"
+        resumed = resume_phrase is not None
         _clear_queue(self.presentation_audio_done)
         ready_deadline = time.monotonic() + 30.0
         while not self.ws_ready.is_set():
@@ -2788,8 +4051,13 @@ class RealtimeBridge:
                         {
                             "type": "input_text",
                             "text": (
-                                f"これから行う発表の{label}の原稿です。\n---\n"
-                                f"{text}\n---"
+                                (
+                                    f"発表の{label}のうち、質疑で中断した箇所から"
+                                    "後の原稿です。\n---\n"
+                                    if resumed
+                                    else f"これから行う発表の{label}の原稿です。\n---\n"
+                                )
+                                + f"{text}\n---"
                             ),
                         }
                     ],
@@ -2801,12 +4069,28 @@ class RealtimeBridge:
         self._request_response(
             purpose=purpose,
             instructions=(
-                f"上の{label}の原稿の内容だけを、自然な発表口調の日本語で話してください。"
+                self._resume_lead(resume_phrase)
+                + f"上の{label}の原稿の内容だけを、自然な発表口調の日本語で話してください。"
                 "原稿に無い事実を足さず、読み上げ調にせず、記号やURLは読まないでください。"
                 "話し終えたら、次へ進む合図や質問をせずに停止してください。"
             ),
         )
-        self._await_presentation_audio(purpose, max(90.0, seconds_hint * 5.0))
+        self._await_presentation_audio(
+            purpose, max(90.0, seconds_hint * 5.0), interruptible=True
+        )
+
+    @staticmethod
+    def _resume_lead(resume_phrase: str | None) -> str:
+        """The instruction prefix for narration resumed after questions."""
+
+        if resume_phrase is None:
+            return ""
+        if resume_phrase:
+            return (
+                f"質疑で中断していた説明を再開します。最初に「{resume_phrase}」と"
+                "一言だけ言い、すでに話した部分は繰り返さずに続けてください。"
+            )
+        return "中断していた説明を、すでに話した部分を繰り返さずに再開してください。"
 
     def _narrate_presentation_slide(
         self,
@@ -2817,16 +4101,17 @@ class RealtimeBridge:
         narration_instructions: str,
         run_id: str,
         script: str | None = None,
+        *,
+        resume_phrase: str | None = None,
+        already_said: str = "",
     ) -> None:
         # A narrated slide nobody can hear is the same failure as a slide that
         # was never narrated, and from inside this process the two look
         # identical.  Check before speaking, and unmute if VRChat says it is
         # muted -- but never on a guess, because the control is a toggle.
         self._ensure_vrchat_microphone_live()
-        data_uri, width, height = self._presentation_image_data_uri(path)
         purpose = f"presentation_slide:{run_id}:{slide_number}"
         _clear_queue(self.presentation_audio_done)
-        self._write_state(presentationReferenceImageSize=[width, height])
         ready_deadline = time.monotonic() + 30.0
         while not self.ws_ready.is_set():
             if self._presentation_cancelled():
@@ -2834,6 +4119,54 @@ class RealtimeBridge:
             if time.monotonic() >= ready_deadline:
                 raise SlidenError("Realtime connection was not ready for narration")
             time.sleep(0.1)
+        if resume_phrase is not None:
+            # Questions interrupted this slide.  The image is already in the
+            # conversation; what is needed is where the talk had got to.
+            if script:
+                body = (
+                    f"第{slide_number}枚のスライドの発表原稿のうち、質疑で中断した"
+                    "箇所から後の部分です。\n---\n"
+                    f"{script}\n---"
+                )
+                instructions = (
+                    self._resume_lead(resume_phrase)
+                    + "上の原稿の残りだけを、自然な発表口調の日本語で話してください。"
+                    "原稿に書かれていない事実・数値・引用を足さないでください。"
+                    "箇条書き記号・記号列・URLは読み上げないでください。"
+                    "話し終えたら次へ進む合図や質問をせず停止してください。"
+                )
+            else:
+                body = (
+                    f"第{slide_number}枚のスライド(先ほど添付した画像)の説明を"
+                    "質疑で中断しました。中断までに話した内容は次のとおりです。\n---\n"
+                    f"{already_said.strip() or '(ほとんど話していません)'}\n---"
+                )
+                instructions = (
+                    self._resume_lead(resume_phrase)
+                    + "このスライドの説明の残りだけを、日本語で短く話してください。"
+                    "画像にない事実を作らず、話し終えたら次へ進む合図や質問をせず"
+                    "停止してください。"
+                )
+            if narration_instructions.strip():
+                instructions += "\n追加指示: " + narration_instructions.strip()
+            if not self._send_now(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": body}],
+                    },
+                }
+            ):
+                raise SlidenError("the resumed script could not be sent to Realtime")
+            self._request_response(purpose=purpose, instructions=instructions)
+            self._await_presentation_audio(
+                purpose, max(60.0, seconds_per_slide * 5.0), interruptible=True
+            )
+            return
+        data_uri, width, height = self._presentation_image_data_uri(path)
+        self._write_state(presentationReferenceImageSize=[width, height])
         sent = self._send_now(
             {
                 "type": "conversation.item.create",
@@ -2890,7 +4223,9 @@ class RealtimeBridge:
         if narration_instructions.strip():
             instructions += "\n追加指示: " + narration_instructions.strip()
         self._request_response(purpose=purpose, instructions=instructions)
-        self._await_presentation_audio(purpose, max(90.0, seconds_per_slide * 5.0))
+        self._await_presentation_audio(
+            purpose, max(90.0, seconds_per_slide * 5.0), interruptible=True
+        )
 
     def _run_presentation(self, command: dict[str, Any]) -> None:
         url = str(command.get("url", "")).strip()
@@ -2912,6 +4247,8 @@ class RealtimeBridge:
         start_slide = int(command.get("startSlide", 1))
         requested_end = command.get("endSlide")
         end_slide = None if requested_end is None else int(requested_end)
+        if command.get("questionMode") not in (None, "", "automatic", "Automatic"):
+            self._set_question_mode(command.get("questionMode"), source="presentation")
         run_id = uuid.uuid4().hex[:12]
         was_muted = self.muted.is_set()
         follower = self.owner_follower
@@ -3044,6 +4381,7 @@ class RealtimeBridge:
                 state_callback=self._presentation_state,
             )
             slide_count = len(slides)
+            self.presentation_slides = list(slides)
             if not 1 <= start_slide <= slide_count:
                 raise SlidenError(
                     f"start slide {start_slide} is outside 1..{slide_count}"
@@ -3124,15 +4462,32 @@ class RealtimeBridge:
                     presentationLastPreviewDifference=difference,
                     presentationConsoleSlide=self.console_slide,
                 )
+            ready, why = self._question_mode_ready(self.question_mode)
+            self._write_state(
+                presentationQuestionMode=self.question_mode,
+                presentationQuestionModeEffective=(
+                    self.question_mode if ready else "question_time"
+                ),
+                presentationQuestionModeReason=why or None,
+            )
             if talk and talk["opening"]:
                 self._presentation_state(presentationPhase="opening")
-                self._narrate_presentation_segment(
-                    "opening", talk["opening"], run_id, seconds_per_slide
+                self._narrate_with_interruptions(
+                    run_id,
+                    "opening",
+                    self._segment_speaker(
+                        "opening", talk["opening"], run_id, seconds_per_slide
+                    ),
+                    script=talk["opening"],
                 )
             scripted: list[int] = []
             advance_differences: list[float] = []
             unconfirmed = 0
-            for slide_number in range(start_slide, actual_end + 1):
+            # A while loop rather than a range: after questions the room may
+            # choose to carry on from a slide it moved to, and the talk has to
+            # be able to go there.
+            slide_number = start_slide
+            while slide_number <= actual_end:
                 if self._presentation_cancelled():
                     raise SlidenCancelled("presentation was cancelled")
                 entry = talk["slides"].get(slide_number) if talk else None
@@ -3146,51 +4501,84 @@ class RealtimeBridge:
                     presentationPhase="narrating",
                     presentationCurrentSlide=slide_number,
                 )
-                self._narrate_presentation_slide(
-                    slides[slide_number - 1],
-                    slide_number,
-                    slide_count,
-                    slide_seconds,
-                    narration_instructions,
+                moved = self._narrate_with_interruptions(
                     run_id,
+                    f"slide{slide_number}",
+                    self._slide_speaker(
+                        slides[slide_number - 1],
+                        slide_number,
+                        slide_count,
+                        slide_seconds,
+                        narration_instructions,
+                        run_id,
+                    ),
                     script=script,
+                    slide_number=slide_number,
                 )
-                if script:
+                if script and slide_number not in scripted:
                     scripted.append(slide_number)
                     self._write_state(presentationScriptedSlides=list(scripted))
-                if slide_number < actual_end:
-                    # Questions are taken at the slide boundary, before the
-                    # console advances: answering about a slide the room can no
-                    # longer see is worse than a slightly longer pause.
-                    if self._presentation_question_window(
-                        run_id, f"slide{slide_number}", question_seconds
-                    ) == "stop":
-                        raise SlidenCancelled("presentation was stopped by voice")
-                    self._presentation_state(presentationPhase="advancing_console")
-                    difference = controller.next_slide()
-                    self.console_slide += 1
-                    self._write_state(presentationConsoleSlide=self.console_slide)
-                    advance_differences.append(round(float(difference), 5))
-                    if difference >= self._ADVANCE_CONFIRM_DIFFERENCE:
-                        unconfirmed = 0
-                    else:
-                        unconfirmed += 1
-                    self._write_state(
-                        presentationLastPreviewDifference=difference,
-                        presentationAdvanceDifferences=advance_differences[-12:],
-                        presentationUnconfirmedAdvances=unconfirmed,
+                if moved is not None:
+                    # Questions in the middle of the slide moved the deck and
+                    # the room chose to carry on from there.
+                    slide_number = moved
+                    continue
+                if slide_number >= actual_end:
+                    break
+                # Questions are taken at the slide boundary, before the
+                # console advances: answering about a slide the room can no
+                # longer see is worse than a slightly longer pause.  Every
+                # question mode takes it: cutting in mid-slide (keywords /
+                # detect) is for the question that cannot wait, and without
+                # the pause a question about what was just said had nowhere
+                # to go -- the next slide began the moment the last one ended
+                # (live, GPT-Live in keywords mode, 2026-09-19).
+                if self._presentation_question_window(
+                    run_id, f"slide{slide_number}", question_seconds
+                ) == "stop":
+                    raise SlidenCancelled("presentation was stopped by voice")
+                # Those questions can move the deck.  Narrating slide N+1 over
+                # slide N-3 is how the script and the screen came apart for the
+                # rest of a run, so reconcile them here -- by asking, because
+                # only the room knows whether it went back to re-hear a slide
+                # or merely to glance at it.
+                resumed = self._resume_after_slide_detour(
+                    controller, slide_number, run_id
+                )
+                if resumed is not None:
+                    slide_number = resumed
+                    continue
+                self._presentation_state(presentationPhase="advancing_console")
+                difference = controller.next_slide()
+                self.console_slide += 1
+                self._write_state(presentationConsoleSlide=self.console_slide)
+                advance_differences.append(round(float(difference), 5))
+                if difference >= self._ADVANCE_CONFIRM_DIFFERENCE:
+                    unconfirmed = 0
+                else:
+                    unconfirmed += 1
+                self._write_state(
+                    presentationLastPreviewDifference=difference,
+                    presentationAdvanceDifferences=advance_differences[-12:],
+                    presentationUnconfirmedAdvances=unconfirmed,
+                )
+                if unconfirmed >= self._ADVANCE_UNCONFIRMED_LIMIT:
+                    raise SlidenError(
+                        "the console did not visibly change slide on "
+                        f"{unconfirmed} consecutive advances "
+                        f"(last difference {difference:.5f}); the room is "
+                        "not seeing the slide being narrated"
                     )
-                    if unconfirmed >= self._ADVANCE_UNCONFIRMED_LIMIT:
-                        raise SlidenError(
-                            "the console did not visibly change slide on "
-                            f"{unconfirmed} consecutive advances "
-                            f"(last difference {difference:.5f}); the room is "
-                            "not seeing the slide being narrated"
-                        )
+                slide_number += 1
             if talk and talk["closing"]:
                 self._presentation_state(presentationPhase="closing")
-                self._narrate_presentation_segment(
-                    "closing", talk["closing"], run_id, seconds_per_slide
+                self._narrate_with_interruptions(
+                    run_id,
+                    "closing",
+                    self._segment_speaker(
+                        "closing", talk["closing"], run_id, seconds_per_slide
+                    ),
+                    script=talk["closing"],
                 )
             if final_question_seconds > 0.0:
                 self._speak_presentation_line(
@@ -3229,6 +4617,7 @@ class RealtimeBridge:
             )
         finally:
             self.presentation_controller = None
+            self.presentation_slides = []
             with self.slide_request_lock:
                 self.slide_request = None
             if controller is not None:
@@ -3244,6 +4633,14 @@ class RealtimeBridge:
                 shutil.rmtree(workspace, ignore_errors=True)
             except Exception:
                 pass
+            try:
+                self._presentation_finished()
+            except Exception as exc:
+                self._write_state(lastError=f"after presentation: {type(exc).__name__}: {exc}")
+
+    def _presentation_finished(self) -> None:
+        """Called once a talk has ended, however it ended.  (Realtime: its
+        per-response instructions leave nothing behind to undo.)"""
 
     def _start_presentation(self, command: dict[str, Any]) -> bool:
         with self.presentation_lock:
@@ -3264,6 +4661,15 @@ class RealtimeBridge:
                 else:
                     self._write_state(avatarMode="Presentation")
             self.presentation_stop_event.clear()
+            # Named before the thread even starts: a second request for the
+            # same talk can arrive within the same model response, and it
+            # has to read as a repeat rather than "another presentation".
+            self._write_state(
+                presentationTitle=str(command.get("presentationTitle") or ""),
+                presentationURL=str(command.get("url") or ""),
+                presentationStatus="starting",
+                presentationPhase="starting",
+            )
             self.presentation_thread = threading.Thread(
                 target=self._run_presentation,
                 args=(dict(command),),
@@ -3375,6 +4781,48 @@ class RealtimeBridge:
             "発表原稿は使えません。原稿なしで進める旨も一言添えてください。"
         )
 
+    def _spoken_request_text(self) -> str:
+        """What the room just said, when this bridge has it as text.
+
+        The Realtime model calls tools on what it heard itself; nothing to
+        cross-check here.  (The GPT-Live bridge returns the transcript.)"""
+
+        return ""
+
+    def _reconcile_title_number(self, title: Any, heard: str) -> Any:
+        """Give the talk the number the room actually said.
+
+        A tool call made by a model that did not hear the request itself
+        (GPT-Live delegates to a backend) came with 「計算と自然31」 for a
+        spoken 「計算と自然、三十三」 (live 2026-09-19), and the room got the
+        wrong deck.  When the utterance names exactly one number and the
+        title carries a different one (or none), the spoken one wins.
+        """
+
+        if not isinstance(title, str) or not heard:
+            return title
+        # Only a request that names the talk counts: 「十三のプレゼンをして
+        # ください」, the tail of a split transcript, would otherwise turn 33
+        # into 13 (live 2026-09-19).
+        stem = title_stem(title)
+        if not stem or stem not in title_stem(heard):
+            return title
+        spoken = sorted(set(spoken_numbers(heard)))
+        if len(spoken) != 1:
+            return title
+        said = spoken[0]
+        written = spoken_numbers(title)
+        if written and written[-1] == said:
+            return title
+        text = unicodedata.normalize("NFKC", title).strip()
+        corrected = (
+            re.sub(r"\d+(?!.*\d)", str(said), text) if written else f"{text}{said}"
+        )
+        self._write_state(
+            presentationTitleCorrected={"given": title, "heard": heard[-120:], "used": corrected}
+        )
+        return corrected
+
     def _presentation_start_command(
         self, title: Any
     ) -> tuple[dict[str, Any], str, dict[str, Any]]:
@@ -3385,6 +4833,9 @@ class RealtimeBridge:
         the same behaviour.
         """
 
+        if isinstance(title, str):
+            title = normalise_title_numbers(title)
+        title = self._reconcile_title_number(title, self._spoken_request_text())
         entry, catalog_route = self._resolve_presentation(title)
         command = {
             "command": "presentation-start",
@@ -3401,10 +4852,149 @@ class RealtimeBridge:
             # "start the talk" works from anywhere in the room without a
             # pointless walk when it is already parked.
             "navigateToConsole": "auto",
-            "navigationTimeoutSeconds": 120.0,
+            # The recipe (frame the wall screen, find the bar, walk at it,
+            # about-face, back off) plus one retry on the other side needs
+            # more than the two minutes that cut a live run off mid-retry
+            # (2026-09-03); the world-join budget is 210 for the same walk.
+            "navigationTimeoutSeconds": 180.0,
             "activatePresentationMode": True,
         }
         return entry, catalog_route, command
+
+    def _presentation_duplicate_result(
+        self, entry: dict[str, Any]
+    ) -> tuple[dict[str, Any], str] | None:
+        """The tool result for a talk that is already the running one.
+
+        Asked to start a named talk, the model called set_avatar_mode with the
+        title *and* start_presentation (live 2026-09-03).  The second call
+        found the first one's thread alive, raised, and the room heard
+        "already running, so it could not be started" -- about the talk it
+        had just started.  A repeat of the running talk is a repeat, not a
+        failure: the result says so and says nothing of failing.  ``None``
+        when nothing is running or a different talk is.
+        """
+
+        if not self._presentation_running():
+            return None
+        with self.state_lock:
+            running_title = str(self.state.get("presentationTitle") or "")
+            running_url = str(self.state.get("presentationURL") or "")
+            phase = str(self.state.get("presentationPhase") or "")
+            navigation = str(self.state.get("presentationNavigationStatus") or "")
+        same = bool(
+            (running_title and running_title == str(entry.get("title", "")))
+            or (running_url and running_url == str(entry.get("url", "")))
+        )
+        if not same:
+            return None
+        payload = {
+            "status": "already_started",
+            "mode": "Presentation",
+            "title": entry["title"],
+            "url": entry["url"],
+            "phase": phase,
+            "navigation": navigation,
+        }
+        instruction = (
+            f"{entry['title']}の発表は既に開始済みで、いま操作パネルへの移動と"
+            "準備を進めています。『開始できなかった』『既に実行中のため』とは"
+            "決して言わず、『はい、準備を進めています』程度に日本語でごく短く"
+            "答えてください。直前に同じことを伝えていれば何も言わなくて構いません。"
+        )
+        return payload, instruction
+
+    def _start_presentation_from_tool(
+        self,
+        call_id: str,
+        name: str,
+        entry: dict[str, Any],
+        catalog_route: str,
+        command: dict[str, Any],
+        extra: dict[str, Any],
+    ) -> str:
+        """Start *entry* for a tool call; returns what to say about it.
+
+        Shared by ``start_presentation`` and ``set_avatar_mode`` with a title
+        so both answer a repeat the same way.
+        """
+
+        if self._start_presentation(command):
+            payload = {
+                "status": "started",
+                "mode": "Presentation",
+                "title": entry["title"],
+                "url": entry["url"],
+                "navigation": "auto",
+                "scripted": entry.get("talk") is not None,
+                "catalog": catalog_route,
+                "catalogError": self.state.get("presentationCatalogError"),
+            }
+            payload.update(extra)
+            self._send_function_output(call_id, payload)
+            self._write_state(lastVoiceCommand=name, lastVoiceCommandValue=entry["title"])
+            return self._presentation_start_instruction(entry, catalog_route)
+        duplicate = self._presentation_duplicate_result(entry)
+        if duplicate is None and self._presentation_running():
+            # Another talk is running: asked for this one, the room wants to
+            # switch.  Refusing left the wrong talk on and the room waiting
+            # after 「了解です」 (live 2026-09-19).
+            with self.state_lock:
+                previous = str(self.state.get("presentationTitle") or "")
+            self._write_state(presentationSwitching={"from": previous, "to": entry["title"]})
+            self._request_presentation_control("stop")
+            thread = self.presentation_thread
+            if thread is not None:
+                thread.join(timeout=20.0)
+            if self._start_presentation(command):
+                payload = {
+                    "status": "switched",
+                    "mode": "Presentation",
+                    "stopped": previous,
+                    "title": entry["title"],
+                    "url": entry["url"],
+                    "scripted": entry.get("talk") is not None,
+                    "catalog": catalog_route,
+                }
+                payload.update(extra)
+                self._send_function_output(call_id, payload)
+                self._write_state(lastVoiceCommand=name, lastVoiceCommandValue=entry["title"])
+                return (
+                    f"『{previous}』を終了し、{entry['title']}のプレゼンを開始しました。"
+                    "完了したとは言わず、切り替えて準備を始めたことだけを日本語で短く"
+                    "伝えてください。"
+                )
+        if duplicate is None:
+            with self.state_lock:
+                running = str(self.state.get("presentationTitle") or "")
+            raise ValueError(
+                f"別の発表『{running or '不明'}』が実行中です。新しい発表を始めるには、"
+                "先に presentation_control の stop で終了してください。"
+            )
+        payload, instruction = duplicate
+        payload = dict(payload)
+        payload.update(extra)
+        self._send_function_output(call_id, payload)
+        self._write_state(lastVoiceCommand=name, lastVoiceCommandValue=entry["title"])
+        return instruction
+
+    def _await_avatar_commands(self, timeout: float = 90.0) -> None:
+        """Wait for the running avatar tool-call batch, if any."""
+
+        thread = self.avatar_command_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+
+    def _handle_avatar_command_calls(self, items: list[dict[str, Any]]) -> None:
+        """Run avatar tool calls in the order the model asked for them."""
+
+        for item in items:
+            try:
+                self._handle_avatar_command_call(item)
+            except Exception as exc:  # never let one call kill the thread
+                self._write_state(
+                    lastError=f"avatar command: {type(exc).__name__}: {exc}"
+                )
 
     def _handle_avatar_command_call(self, item: dict[str, Any]) -> None:
         call_id = str(item.get("call_id", ""))
@@ -3458,29 +5048,9 @@ class RealtimeBridge:
                     entry, catalog_route, command = self._presentation_start_command(
                         spoken_title
                     )
-                    if not self._start_presentation(command):
-                        raise ValueError("a presentation is already running")
-                    self._send_function_output(
-                        call_id,
-                        {
-                            "status": "started",
-                            "mode": canonical,
-                            "title": entry["title"],
-                            "url": entry["url"],
-                            "navigation": "auto",
-                            "scripted": entry.get("talk") is not None,
-                            "catalog": catalog_route,
-                            "catalogError": self.state.get(
-                                "presentationCatalogError"
-                            ),
-                        },
-                    )
-                    self._write_state(
-                        lastVoiceCommand=name,
-                        lastVoiceCommandValue=entry["title"],
-                    )
-                    response_instruction = self._presentation_start_instruction(
-                        entry, catalog_route
+                    response_instruction = self._start_presentation_from_tool(
+                        call_id, name, entry, catalog_route, command,
+                        {"mode": canonical},
                     )
                 elif canonical == "Presentation" and not self._presentation_running():
                     self._write_state(presentationStatus="awaiting_title")
@@ -3522,27 +5092,8 @@ class RealtimeBridge:
                 entry, catalog_route, command = self._presentation_start_command(
                     arguments.get("title", "")
                 )
-                if not self._start_presentation(command):
-                    raise ValueError("a presentation is already running")
-                self._send_function_output(
-                    call_id,
-                    {
-                        "status": "started",
-                        "mode": "Presentation",
-                        "title": entry["title"],
-                        "url": entry["url"],
-                        "navigation": "auto",
-                        "scripted": entry.get("talk") is not None,
-                        "catalog": catalog_route,
-                        "catalogError": self.state.get("presentationCatalogError"),
-                    },
-                )
-                self._write_state(
-                    lastVoiceCommand=name,
-                    lastVoiceCommandValue=entry["title"],
-                )
-                response_instruction = self._presentation_start_instruction(
-                    entry, catalog_route
+                response_instruction = self._start_presentation_from_tool(
+                    call_id, name, entry, catalog_route, command, {}
                 )
             elif name == "presentation_control":
                 action = self._request_presentation_control(
@@ -3555,9 +5106,20 @@ class RealtimeBridge:
                 )
                 self._write_state(lastVoiceCommand=name, lastVoiceCommandValue=action)
                 response_instruction = {
-                    "pause": "発表を一時停止しました。『再開して』と言われるまで待つ旨を日本語で短く伝えてください。",
+                    "pause": (
+                        "発表を一時停止しました。『再開して』と言われるまで待つこと、"
+                        "終わりにするなら『発表を終了して』と言ってもらえばよいことを、"
+                        "日本語で短く伝えてください。直前に『了解です』と言っていれば繰り返さないでください。"
+                    ),
                     "resume": "発表を再開します。その事実だけを日本語でごく短く伝えてください。",
-                    "stop": "発表を終了しました。その事実だけを日本語でごく短く伝えてください。",
+                    "stop": (
+                        "発表を終了しました。その事実だけを日本語でごく短く伝えてください。"
+                        "直前に『了解です』と言っていれば繰り返さないでください。"
+                    ),
+                    "resume_here": "いま表示しているスライドから発表を続けます。"
+                    "その事実だけを日本語でごく短く伝えてください。",
+                    "resume_back": "発表が進んでいた場所へ戻って続けます。"
+                    "その事実だけを日本語でごく短く伝えてください。",
                 }[action]
             elif name == "show_slide":
                 if not self._presentation_running():
@@ -3640,7 +5202,20 @@ class RealtimeBridge:
                 call_id,
                 {"status": "error", "message": str(exc)},
             )
-            self._request_response()
+            # An unsteered response.create let the model answer a failed
+            # start_presentation with "では準備しますね" and then do nothing,
+            # which is indistinguishable from a working start until the room
+            # has waited a few minutes (live 2026-09-04).  Say what failed and
+            # forbid the reassuring version.
+            self._request_response(
+                purpose="avatar_voice_command_error",
+                instructions=(
+                    "直前の操作は失敗しました。理由: " + str(exc) + " "
+                    "『始めます』『準備します』のように成功したかのようには決して"
+                    "言わず、できなかった事実とこの理由を日本語でごく短く伝えて"
+                    "ください。同じ操作をもう一度呼び直さないでください。"
+                ),
+            )
 
     def _addressed_frontally(self, grace_seconds: float = 3.0) -> bool:
         """Is somebody facing the avatar and speaking to it right now?
@@ -3678,6 +5253,36 @@ class RealtimeBridge:
             self._reset_input_gate()
         self._request_response(purpose=reason, instructions=instructions)
 
+    def _apply_voice_control(self, action: str, heard: str, *, source: str) -> bool:
+        """Pause / resume / stop the running talk because the room asked.
+
+        Acted on here, not left to a model's tool call.  A pause during
+        narration also cuts the narration at once; the question window it
+        opens holds the talk until 「再開して」."""
+
+        if action not in ("stop", "pause", "resume") or not self._presentation_running():
+            return False
+        if action == "resume":
+            with self.state_lock:
+                paused = bool(self.state.get("presentationPaused"))
+            if not paused:
+                return False
+        self._write_state(
+            lastVoiceControl={"action": action, "heard": heard[:120], "source": source,
+                              "at": time.time()}
+        )
+        self._request_presentation_control(action)
+        if action == "pause" and self.presentation_narrating.is_set():
+            self._request_talk_interrupt("control", heard, force=True)
+        if action == "stop" and source == "keyword":
+            # Heard only by the local recogniser: the model knows nothing of
+            # it, so say what happened.
+            self._request_response(
+                purpose="presentation_stopped",
+                instructions="日本語で「発表を終了しました」とだけ言ってください。",
+            )
+        return True
+
     def _on_voice_keyword(self, action: str, text: str, confidence: float) -> None:
         """A locally spotted "会話に参加" / "会話から離脱" / greeting."""
 
@@ -3686,6 +5291,19 @@ class RealtimeBridge:
             lastVoiceCommandValue=text,
             voiceCommandLastConfidence=round(float(confidence), 3),
         )
+        if action == "control":
+            if self._apply_voice_control(control_action(text) or "", text, source="keyword"):
+                return
+            action = "question"
+        if action == "question":
+            if self._keyword_interrupt_armed():
+                self._request_talk_interrupt("keywords", text)
+                return
+            # Outside a talk listening for keywords, "すみません、質問…" is
+            # still the greeting it contains.
+            if not has_greeting(text):
+                return
+            action = "greeting"
         if action == "greeting":
             # Only meaningful while the conversation was explicitly left; the
             # ordinary visual gate handles greetings the rest of the time.
@@ -4286,12 +5904,44 @@ class RealtimeBridge:
                 "conversation_control",
             }
         ]
+        fresh_avatar_calls = []
         for item in avatar_command_calls:
             call_id = str(item.get("call_id", ""))
             if not call_id or call_id in self.handled_tool_calls:
                 continue
             self.handled_tool_calls.add(call_id)
-            self._handle_avatar_command_call(item)
+            fresh_avatar_calls.append(item)
+        if fresh_avatar_calls:
+            # Off the websocket thread.  start_presentation resolves the title
+            # through the SourceVault registry, and that request waits on the
+            # service kernel: when a maintenance tick had the service busy the
+            # lookup took its full 60 s timeout *inside this callback*, so no
+            # audio delta and no event was read for a minute and the session
+            # reconnected (live 2026-09-04).  Every other blocking tool already
+            # runs on its own thread; these have to as well.  One thread for
+            # the whole list, not one each: a response that calls
+            # set_avatar_mode and start_presentation together depends on being
+            # handled in the order the model asked for.
+            thread = threading.Thread(
+                target=self._handle_avatar_command_calls,
+                args=(fresh_avatar_calls,),
+                daemon=True,
+                name="VRCRealtimeAvatarCommands",
+            )
+            self.avatar_command_thread = thread
+            thread.start()
+        for item in output:
+            if not (
+                isinstance(item, dict)
+                and item.get("type") == "function_call"
+                and item.get("name") == "set_question_mode"
+            ):
+                continue
+            call_id = str(item.get("call_id", ""))
+            if not call_id or call_id in self.handled_tool_calls:
+                continue
+            self.handled_tool_calls.add(call_id)
+            self._handle_question_mode_call(item)
         vision_calls = [
             item
             for item in output
@@ -4341,6 +5991,8 @@ class RealtimeBridge:
             # own playback and must discard/truncate audio already received.
             if self.args.allow_barge_in and self.output_active.is_set():
                 self._interrupt_playback()
+        elif event_type == "input_audio_buffer.committed":
+            self.input_committed_at = time.time()
         elif event_type == "input_audio_buffer.speech_stopped":
             self._touch_visual_session("speech_stopped")
             if self.owner_follower is not None:
@@ -4415,8 +6067,38 @@ class RealtimeBridge:
             self._write_state(lastError=json.dumps(detail, ensure_ascii=False))
 
     def _on_error(self, _ws: websocket.WebSocketApp, error: Any) -> None:
+        status = getattr(error, "status_code", None)
+        if isinstance(status, int):
+            self._handshake_status = status
         if not self.stop_event.is_set():
             self._write_state(lastError=f"websocket: {error}")
+
+    # ---- connection hooks (VRCRealtime_live.LiveVRCBridge overrides these)
+
+    def _ws_url(self) -> str:
+        return "wss://api.openai.com/v1/realtime?model=" + quote(self.args.model, safe="")
+
+    def _ws_headers(self) -> list[str]:
+        headers = [f"Authorization: Bearer {self.api_key}"]
+        if self.args.safety_identifier:
+            headers.append(f"OpenAI-Safety-Identifier: {self.args.safety_identifier}")
+        return headers
+
+    def _run_forever_options(self) -> dict[str, Any]:
+        return {}
+
+    def _extra_threads(self) -> list[threading.Thread]:
+        return []
+
+    def _handshake_message(self, status: int) -> str:
+        if status == 401:
+            return "OpenAI に認証されませんでした (401)。API キーを確認してください。"
+        if status == 403:
+            return (
+                f"OpenAI への接続が拒否されました (403)。この API キーで {self.args.model} "
+                "が使えるか (権限・モデル制限) を確認してください。"
+            )
+        return f"接続先が見つかりません (404)。モデル名 {self.args.model} を確認してください。"
 
     def _on_close(
         self,
@@ -4478,6 +6160,11 @@ class RealtimeBridge:
                 self._request_presentation_control(str(command.get("value", "")))
             except ValueError as exc:
                 self._write_state(presentationLastError=str(exc))
+        elif name == "question-mode":
+            if self._set_question_mode(command.get("value"), source="notebook") is None:
+                self._write_state(
+                    lastError=f"unknown question mode: {command.get('value')!r}"
+                )
         elif name == "mode":
             follower = self.owner_follower
             value = command.get("value")
@@ -4643,13 +6330,7 @@ class RealtimeBridge:
         if self.voice_commands is not None:
             self.voice_commands.start()
         if self.args.input_source == "vrchat":
-            pid = self.args.vrchat_pid if self.args.vrchat_pid > 0 else None
-            self.speaker = SpeakerLoop(
-                self._speaker_callback,
-                chunk_seconds=self.args.chunk_ms / 1000.0,
-                pid=pid,
-            )
-            self.speaker.start()
+            self._start_speaker()
 
         threads = [
             threading.Thread(target=self._input_sender, daemon=True),
@@ -4658,6 +6339,7 @@ class RealtimeBridge:
             threading.Thread(target=self._control_file_worker, daemon=True),
             threading.Thread(target=self._response_create_worker, daemon=True),
             threading.Thread(target=self._session_watchdog, daemon=True),
+            threading.Thread(target=self._speaker_watchdog, daemon=True),
             threading.Thread(target=self._status_worker, daemon=True),
             threading.Thread(target=self._vrchat_state_worker, daemon=True),
         ]
@@ -4665,24 +6347,17 @@ class RealtimeBridge:
             threads.append(threading.Thread(target=self._private_broker_worker, daemon=True))
         if self.args.input_source == "microphone":
             threads.append(threading.Thread(target=self._microphone_worker, daemon=True))
+        threads.extend(self._extra_threads())
         for thread in threads:
             thread.start()
 
         reconnect_count = 0
         try:
             while not self.stop_event.is_set():
-                url = (
-                    "wss://api.openai.com/v1/realtime?model="
-                    + quote(self.args.model, safe="")
-                )
-                headers = [f"Authorization: Bearer {self.api_key}"]
-                if self.args.safety_identifier:
-                    headers.append(
-                        f"OpenAI-Safety-Identifier: {self.args.safety_identifier}"
-                    )
+                self._handshake_status = None
                 app = websocket.WebSocketApp(
-                    url,
-                    header=headers,
+                    self._ws_url(),
+                    header=self._ws_headers(),
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
@@ -4690,9 +6365,20 @@ class RealtimeBridge:
                 )
                 with self.ws_lock:
                     self.ws = app
-                app.run_forever(ping_interval=20, ping_timeout=10)
+                app.run_forever(
+                    ping_interval=20, ping_timeout=10, **self._run_forever_options()
+                )
                 with self.ws_lock:
                     self.ws = None
+                if self._handshake_status in (401, 403, 404):
+                    # Refused, not dropped: retrying every second only hides
+                    # the reason behind a reconnect counter.
+                    self._write_state(
+                        status="error",
+                        handshakeStatus=self._handshake_status,
+                        lastError=self._handshake_message(self._handshake_status),
+                    )
+                    break
                 if self.stop_event.wait(1.0):
                     break
                 reconnect_count += 1
@@ -4701,7 +6387,9 @@ class RealtimeBridge:
             self.stop_event.set()
             self.ws_ready.clear()
             if self.speaker is not None:
-                self.speaker.close()
+                # close() re-raises whatever ended the capture thread; that
+                # must not skip the rest of the shutdown.
+                self._close_quietly(self.speaker)
             if self.owner_follower is not None:
                 self.owner_follower.close()
             if self.voice_commands is not None:
@@ -4730,6 +6418,29 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--state-file", required=True)
     parser.add_argument("--control-file", default="")
     parser.add_argument("--model", default="gpt-realtime-2.1")
+    # auto: gpt-live-* speaks the GPT-Live protocol (VRCRealtime_live.py),
+    # everything else the Realtime one.
+    parser.add_argument("--api", choices=("auto", "realtime", "live"), default="auto")
+    # GPT-Live delegates tool work to a Responses model (tools, vision).
+    parser.add_argument("--live-backend-model", default="gpt-5.6-luna")
+    parser.add_argument(
+        "--live-backend-reasoning",
+        choices=("none", "minimal", "low", "medium", "high"),
+        default="low",
+    )
+    # GPT-Live: an utterance ends when no voiced audio has arrived for this
+    # long (a script read aloud gets the longer one, with the coverage check).
+    parser.add_argument("--live-idle-ms", type=int, default=900)
+    parser.add_argument("--live-narration-idle-ms", type=int, default=1400)
+    parser.add_argument("--live-narration-stall-ms", type=int, default=6000)
+    parser.add_argument("--live-ack-timeout-ms", type=int, default=8000)
+    # GPT-Live listens while it speaks.  Outside a talk the room is heard
+    # all the time; --no-live-full-duplex restores the Realtime half duplex.
+    parser.add_argument(
+        "--live-full-duplex", action=argparse.BooleanOptionalAction, default=True
+    )
+    # GPT-Live exchange log (JSONL, no audio).  Empty = %TEMP%/vrc-live-events.jsonl.
+    parser.add_argument("--live-event-log", default="")
     parser.add_argument("--voice", default="marin")
     parser.add_argument(
         "--instructions",
@@ -4816,6 +6527,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--voice-command-model-dir", default="")
     parser.add_argument("--no-voice-command-download", action="store_true")
     parser.add_argument("--voice-command-min-confidence", type=float, default=0.45)
+    # How a talk takes questions: question_time (only at slide boundaries,
+    # the historical behaviour), keywords (a spoken 「質問」「スライド」「プレゼン」「発表」
+    # interrupts the slide being narrated) or detect (sustained voice in the
+    # room pauses the talk and the model judges whether it was a question).
+    parser.add_argument(
+        "--question-mode",
+        choices=QUESTION_MODES,
+        default="question_time",
+    )
+    parser.add_argument("--interrupt-words", default=",".join(DEFAULT_INTERRUPT_WORDS))
+    # detect: room-audio RMS and how long it has to stay above it.
+    parser.add_argument("--interrupt-rms", type=float, default=0.02)
+    parser.add_argument("--interrupt-ms", type=int, default=450)
+    # After an interruption: quiet that ends the questions and resumes the
+    # talk, and how long a fresh interruption is ignored afterwards.
+    parser.add_argument("--interrupt-resume-seconds", type=float, default=4.0)
+    parser.add_argument("--interrupt-cooldown-seconds", type=float, default=8.0)
     parser.add_argument("--osc-host", default="127.0.0.1")
     parser.add_argument("--osc-port", type=int, default=9000)
     parser.add_argument("--osc-listen-port", type=int, default=9001)
@@ -4930,6 +6658,14 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--osc-port must be between 1 and 65535")
     if not 0.0 <= args.voice_command_min_confidence <= 1.0:
         parser.error("--voice-command-min-confidence must be between 0 and 1")
+    if not 0.001 <= args.interrupt_rms <= 0.5:
+        parser.error("--interrupt-rms must be between 0.001 and 0.5")
+    if not 100 <= args.interrupt_ms <= 5000:
+        parser.error("--interrupt-ms must be between 100 and 5000")
+    if not 1.0 <= args.interrupt_resume_seconds <= 60.0:
+        parser.error("--interrupt-resume-seconds must be between 1 and 60")
+    if not 0.0 <= args.interrupt_cooldown_seconds <= 120.0:
+        parser.error("--interrupt-cooldown-seconds must be between 0 and 120")
     if not 1 <= args.osc_listen_port <= 65535:
         parser.error("--osc-listen-port must be between 1 and 65535")
     if not 320 <= args.vision_image_max_width <= 1920:
@@ -4948,6 +6684,15 @@ def _parse_args() -> argparse.Namespace:
             "--avatar-mode owner-follow/presentation requires --visual-attention-gate"
         )
     return args
+
+
+def resolve_api(model: str, requested: str = "auto") -> str:
+    """"live" for gpt-live-* models, "realtime" otherwise (or as requested)."""
+
+    requested = str(requested or "auto").strip().casefold()
+    if requested in ("live", "realtime"):
+        return requested
+    return "live" if str(model).strip().casefold().startswith("gpt-live") else "realtime"
 
 
 def _navigation_mode(value: Any) -> str | None:
@@ -5066,7 +6811,12 @@ def main() -> int:
                     "SourceVault local TTS configuration is incomplete: "
                     + ", ".join(missing)
                 )
-        bridge = RealtimeBridge(args)
+        if resolve_api(args.model, args.api) == "live":
+            from VRCRealtime_live import LiveVRCBridge
+
+            bridge = LiveVRCBridge(args)
+        else:
+            bridge = RealtimeBridge(args)
         write_worker_lock(args)
 
         def request_stop(_signum: int, _frame: Any) -> None:

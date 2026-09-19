@@ -1329,6 +1329,30 @@ def _split_url_bar(
     )
 
 
+def _url_pasted(text: str | None, url: str) -> bool | None:
+    """Does the OCR'd text of the URL dialog's field show *url*?
+
+    ``None`` when there was nothing to read (no OCR, no frame): the caller
+    then trusts the paste.  The field's placeholder ("Enter Slide URL...")
+    reads as False, which is the case worth catching -- a submit on an empty
+    field does nothing, and the dialog simply stays open.
+    """
+
+    if text is None:
+        return None
+    compact = "".join(text.split()).lower()
+    if not compact:
+        return False
+    target = url.strip().lower()
+    name = target.rsplit("/", 1)[-1]
+    if name and name in compact:
+        return True
+    host = target.split("//", 1)[-1].split("/", 1)[0]
+    if host and host in compact:
+        return True
+    return SequenceMatcher(None, compact, target).ratio() >= 0.6
+
+
 def detect_sliden_console(
     image: RGBImage,
     *,
@@ -2101,6 +2125,7 @@ class SlidenConsoleController:
         osc_port: int = 9000,
         clear_text: Callable[[], None] | None = None,
         paste: Callable[[str], None] | None = None,
+        press_enter: Callable[[], None] | None = None,
         state_callback: Callable[..., Any] | None = None,
         diagnostic_directory: Path | None = None,
         text_locator: Callable[[RGBImage], Sequence[tuple[str, Rect]]] | None = None,
@@ -2152,6 +2177,7 @@ class SlidenConsoleController:
         self._console_observation: SlidenConsoleObservation | None = None
         self.diagnostic_directory = diagnostic_directory
         self._diagnostics_written = 0
+        self._stage_frames_written = 0
         #: Cached window handle and screen grabber for the fast capture path.
         self._window_handle: int | None = None
         self._screen_grabber: Any | None = None
@@ -2162,6 +2188,7 @@ class SlidenConsoleController:
         self._last_text_boxes: list[Rect] = []
         self._clear_text_callback = clear_text
         self._paste_callback = paste
+        self._enter_callback = press_enter
 
     #: Attempts and spacing for an input that Windows refused to deliver
     #: because VRChat was not the foreground window.  Something else holding
@@ -2323,7 +2350,37 @@ class SlidenConsoleController:
 
     #: Most before/after pairs written per run.  Enough to see a pattern,
     #: few enough that a long presentation cannot fill a disk.
-    _DIAGNOSTIC_LIMIT = 8
+    _DIAGNOSTIC_LIMIT = 16
+    #: Frames of the panel-approach recipe, one per stage change and a
+    #: few per stage.  A run that dies "timed out (approaching_bar)" left
+    #: nothing to look at but the facing frames (2026-09-03); JPEG so the
+    #: budget is a few tens of megabytes, not hundreds.
+    _STAGE_DIAGNOSTIC_LIMIT = 48
+
+    def _save_stage_frame(self, stage: str, frame: RGBImage, note: str = "") -> None:
+        """Keep a frame of the panel-approach recipe with a one-line note.
+
+        ``_save_diagnostic`` records aim failures; this records the walk
+        itself, so a run that times out in ``approaching_bar`` can be read
+        back stage by stage instead of guessed at from the state numbers.
+        """
+
+        directory = self.diagnostic_directory
+        if directory is None or self._stage_frames_written >= self._STAGE_DIAGNOSTIC_LIMIT:
+            return
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            index = self._stage_frames_written
+            self._stage_frames_written += 1
+            cv2.imwrite(
+                str(directory / f"nav-{index:02d}-{stage}.jpg"),
+                cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                [int(cv2.IMWRITE_JPEG_QUALITY), 80],
+            )
+            with (directory / "nav.log").open("a", encoding="utf-8") as handle:
+                handle.write(f"{index:02d} {stage} {note}\n")
+        except Exception:
+            pass
 
     def _save_diagnostic(
         self,
@@ -2968,6 +3025,93 @@ class SlidenConsoleController:
         "back", "look", "side", "look",
     )
 
+    #: Vertical field of view of the VRChat desktop camera.  With the pitch
+    #: calibration it turns mouse counts into pixels of the capture, which is
+    #: how the facing stage knows where the horizon is in a pitched view.
+    _VERTICAL_FOV_DEGREES = 60.0
+
+    def _pitch_pixels_per_count(self, height: int) -> float:
+        counts_per_degree = float(self._PITCH_COUNTS_PER_180) / 180.0
+        return height / (self._VERTICAL_FOV_DEGREES * counts_per_degree)
+
+    def _facing_target(
+        self,
+        frame: RGBImage,
+        viewport: Point,
+        observation: SlidenConsoleObservation,
+        page: tuple[Rect, NDArray[np.float32]] | None,
+    ) -> tuple[Rect | None, str, bool]:
+        """What to steer at after the about-face: ``(rect, kind, clipped)``.
+
+        A recognized console or a wordmarked panel page wins outright.  Failing
+        those, a bare dark page counts when it is *below the horizon* -- and
+        where the horizon is depends on how far down the camera is pitched.
+        After the about-face it is ``_FACE_PITCH_COUNTS`` under level, and
+        from there the whole frame is below the horizon: a page in the top of
+        the view is the panel at the avatar's feet, not the wall screen.  The
+        old rule kept the lower half regardless and, on the live run of
+        2026-09-03, let the panel's page sit clipped against the top edge
+        while the loop steered at the progress bar under it, never tilted up
+        to the URL field and finally called the panel "the sub-screen".
+
+        ``clipped`` says the page runs off the top of the capture, where the
+        URL field lives -- the caller tilts up before judging anything.
+        """
+
+        height, width = frame.shape[:2]
+        target: Rect | None = None
+        kind = ""
+        if observation.slide_quad is not None:
+            quad = observation.slide_quad
+            target = Rect(
+                int(quad[:, 0].min()), int(quad[:, 1].min()),
+                int(quad[:, 0].max() - quad[:, 0].min()),
+                int(quad[:, 1].max() - quad[:, 1].min()),
+            )
+            kind = "console"
+        elif page is not None:
+            target = page[0]
+            kind = "page"
+        else:
+            horizon = viewport[1] - self._pitch_offset * self._pitch_pixels_per_count(height)
+            floor_line = min(viewport[1] - 0.05 * height, horizon)
+            steep = self._pitch_offset >= 250.0
+            lower = [
+                candidate for candidate in _display_candidates(frame)
+                if 0.01 <= candidate.area_fraction <= 0.45
+                and candidate.rect.center[1] >= floor_line
+                and (steep or candidate.rect.y > 4)
+            ]
+            if lower:
+                if steep:
+                    # Looking down at our feet the panel is the biggest dark
+                    # thing in view; the nearest-to-centre rule was for a
+                    # level camera with furniture in the way.
+                    target = max(lower, key=lambda c: c.area_fraction).rect
+                else:
+                    target = min(
+                        lower,
+                        key=lambda c: math.hypot(
+                            c.rect.center[0] - viewport[0], c.rect.center[1] - viewport[1]
+                        ),
+                    ).rect
+                kind = "dark_page"
+            else:
+                # The panel's own bright bars -- URL field above, progress
+                # bar below -- are visible when its dark page is not
+                # segmented (glare, partial view).  Steer to the biggest one
+                # in the lower part of the view.
+                low_bars = [
+                    (length, rect)
+                    for rect, length, _thickness in _bright_horizontal_bars(frame)
+                    if rect.center[1] >= 0.35 * height and length >= 0.08 * width
+                ]
+                if low_bars:
+                    target = max(low_bars, key=lambda item: item[0])[1]
+                    kind = "bar"
+        clipped = target is not None and target.y <= 0.05 * height
+        return target, kind, clipped
+
     def approach_operation_panel(
         self,
         *,
@@ -3018,6 +3162,8 @@ class SlidenConsoleController:
         face_last_width = 0.0
         face_last_center: Point | None = None
         face_relook = 0
+        loop_index = 0
+        last_stage = ""
         # Level the camera absolutely: the phase before this one (the room
         # entry, an earlier attempt, whatever the operator left) may have
         # left it pitched, and a sweep run "level" from a downward view
@@ -3047,6 +3193,14 @@ class SlidenConsoleController:
                 continue
             height, width = frame.shape[:2]
             viewport = self._viewport_center(frame)
+            loop_index += 1
+            if stage != last_stage or loop_index % 12 == 0:
+                self._save_stage_frame(
+                    stage, frame,
+                    f"side={side} pitch={self._pitch_offset:.0f} "
+                    f"backoffs={back_offs} steps={approach_steps} face={face_steps}",
+                )
+                last_stage = stage
 
             if stage == "framing_screen":
                 # Too close to any Sliden page to see its surroundings.
@@ -3365,45 +3519,9 @@ class SlidenConsoleController:
             if stage == "facing_panel":
                 observation = detect_sliden_console(frame)
                 page = detect_sliden_panel_page(frame, minimum_score=0.34)
-                target: Rect | None = None
-                if observation.slide_quad is not None:
-                    quad = observation.slide_quad
-                    target = Rect(
-                        int(quad[:, 0].min()), int(quad[:, 1].min()),
-                        int(quad[:, 0].max() - quad[:, 0].min()),
-                        int(quad[:, 1].max() - quad[:, 1].min()),
-                    )
-                elif page is not None:
-                    target = page[0]
-                else:
-                    # A bare page below eye level and not filling the frame:
-                    # the wall screen, if it is in view at all after the
-                    # turn, is large and sits at or above the horizon.
-                    lower = [
-                        candidate for candidate in _display_candidates(frame)
-                        if 0.01 <= candidate.area_fraction <= 0.30
-                        and candidate.rect.center[1] >= viewport[1] - 0.05 * height
-                        and candidate.rect.y > 4
-                    ]
-                    if lower:
-                        target = min(
-                            lower,
-                            key=lambda c: math.hypot(
-                                c.rect.center[0] - viewport[0], c.rect.center[1] - viewport[1]
-                            ),
-                        ).rect
-                    else:
-                        # The panel's own bright bars -- URL field above,
-                        # progress bar below -- are visible when its dark
-                        # page is not segmented (glare, partial view).  Steer
-                        # to the biggest one in the lower part of the view.
-                        low_bars = [
-                            (length, rect)
-                            for rect, length, _thickness in _bright_horizontal_bars(frame)
-                            if rect.center[1] >= 0.35 * height and length >= 0.08 * width
-                        ]
-                        if low_bars:
-                            target = max(low_bars, key=lambda item: item[0])[1]
+                target, target_kind, clipped_top = self._facing_target(
+                    frame, viewport, observation, page
+                )
                 if self.diagnostic_directory is not None and face_steps < 12:
                     self._save_diagnostic("facing", frame, None, None, None)
                 report(
@@ -3411,6 +3529,9 @@ class SlidenConsoleController:
                     presentationNavigationFaceSteps=face_steps,
                     presentationConsoleWidthFraction=None if target is None else round(target.width / width, 3),
                     presentationNavigationFaceTarget=None if target is None else [target.x, target.y, target.width, target.height],
+                    presentationNavigationFaceTargetKind=target_kind,
+                    presentationNavigationFaceClipped=clipped_top,
+                    presentationNavigationFacePitch=round(self._pitch_offset),
                 )
                 if target is None:
                     face_steps += 1
@@ -3448,14 +3569,31 @@ class SlidenConsoleController:
                     continue
                 error_x = float(target.center[0] - viewport[0])
                 error_y = float(target.center[1] - viewport[1])
+                face_last_center = target.center
+                face_relook = 0
+                if clipped_top and observation.url_field is None:
+                    # The page runs off the top of the capture.  The URL field
+                    # sits along the panel's upper edge, so it cannot be in the
+                    # frame however well the rest is centred, and the checks
+                    # below would call the panel a sub-screen for lacking it.
+                    # Tilt up first (live 2026-09-03: the about-face left the
+                    # camera 60 degrees down with the panel a step away, and
+                    # its page filled the top of the view); backing off and
+                    # centring take over once the whole page is in.
+                    move_y = -max(30.0, min(60.0, 0.22 * abs(error_y)))
+                    move_y = max(move_y, -120.0 - self._pitch_offset)
+                    self._pitch_offset += move_y
+                    self._move_relative(
+                        (max(-45.0, min(45.0, 0.28 * error_x)), move_y)
+                    )
+                    time.sleep(max(0.10, self.poll_seconds))
+                    continue
                 # Stand back far enough to drive the panel from here: aiming
                 # at the Next button lifts the URL bar towards the top of the
                 # capture, and from arm's length it leaves the frame -- with
                 # it goes the console's identity and the click is refused
                 # (measured 2026-08-15: 490 px of panel against 360 px of
                 # headroom).  A page under ~0.32 of the view keeps both.
-                face_last_center = target.center
-                face_relook = 0
                 too_close = target.width > self._ARRIVAL_MAX_WIDTH_FRACTION * width or (
                     observation.url_field_rect is not None
                     and observation.url_field_rect.y < 0.10 * height
@@ -3503,6 +3641,23 @@ class SlidenConsoleController:
                     )
                     return observation
                 confirm_frames += 1
+                if confirm_frames in (2, 6):
+                    # Centred on a Sliden page whose URL field has not
+                    # resolved from this exact attitude.  Glance through the
+                    # pitch bands the way configure_url would before doubting
+                    # the page: the field is a thin bar along the top edge,
+                    # and one head-tilt is often all that separates "no URL
+                    # field" from a usable panel.
+                    glance = self.console_in_view(timeout_seconds=4.5)
+                    if glance is not None:
+                        _state(
+                            self.state_callback,
+                            presentationPhase="at_sliden_console",
+                            presentationNavigationStatus="aligned",
+                            presentationConsoleDistanceReady=True,
+                        )
+                        return glance
+                    continue
                 if confirm_frames in (4, 8):
                     # Centred on a page without a URL field.  Before calling
                     # it the sub-screen, make sure it is not just the top of
@@ -3510,9 +3665,17 @@ class SlidenConsoleController:
                     self._walk_backward(0.22)
                     time.sleep(max(0.18, self.poll_seconds))
                     continue
-                if confirm_frames > 12:
-                    # Centred on a Sliden page with no URL field: the
+                fully_in_view = (
+                    target.y > 0.05 * height
+                    and target.bottom < 0.97 * height
+                    and target.width <= 0.45 * width
+                )
+                if confirm_frames > 12 and (fully_in_view or confirm_frames > 20):
+                    # Centred on a whole Sliden page with no URL field: the
                     # sub-screen.  Its side is wrong; leave for the other one.
+                    # A page still cut by the frame edge, or filling it, is
+                    # not judged yet -- it keeps being tilted at and backed
+                    # away from for a while longer.
                     rejected.add(side)
                     report(presentationNavigationCandidateRejected=True)
                     raise SlidenConsoleNotFound(
@@ -4805,8 +4968,26 @@ class SlidenConsoleController:
                     self._record_aim_response(0, pending_command[0], moved[0], floor)
                     self._record_aim_response(1, pending_command[1], moved[1], floor)
                 responded = jumped or math.hypot(moved[0], moved[1]) >= floor
-                calibrated = any(gain is not None for gain in self._aim_gain)
-                if not responded and not calibrated:
+                # Per axis, never "any axis".  The probe drives whichever axis
+                # has no measured gain yet, so an axis still probing is the
+                # reason a frame looks motionless -- and it is that axis whose
+                # probe has to grow.  Judged jointly, one calibrated axis
+                # froze the other's probe at its timid opening value and made
+                # every gentle frame read as a client that had stopped
+                # responding: live 2026-09-04 the horizontal axis converged
+                # (gain 1.96) while the vertical one never calibrated, 151
+                # pixels off target, and the servo concluded a menu had the
+                # mouse and pressed Escape -- which, with no menu open, opened
+                # one over the room and ended the presentation.
+                probing = any(
+                    abs(pending_command[axis]) >= 1.0
+                    and self._aim_gain[axis] is None
+                    for axis in (0, 1)
+                )
+                # Evaluated before the probe grows: the frame that pushes the
+                # probe to its ceiling has not tried the bigger probe yet.
+                room_to_probe = probing and self._aim_probe < self._AIM_PROBE_MAXIMUM
+                if not responded and probing:
                     # The probe was too gentle to read.  Push harder rather
                     # than concluding anything about the camera.
                     self._aim_probe = min(
@@ -4816,7 +4997,7 @@ class SlidenConsoleController:
                     responded
                     or carried_point
                     or measure_carried
-                    or not (calibrated or self._aim_probe >= self._AIM_PROBE_MAXIMUM)
+                    or room_to_probe
                 ):
                     # "The camera is frozen" is a claim about the client, and
                     # only clean recognitions can support it.
@@ -4922,8 +5103,31 @@ class SlidenConsoleController:
                     presentationConsoleAimStalled=True,
                     presentationConsoleMenuDismissals=menu_dismissals,
                 )
+                # Escape toggles, so the guess costs something when it is
+                # wrong: with no menu open the press opens the main one, over
+                # the room, and the console that was plainly visible in this
+                # very frame disappears behind it.  Undo it at once rather
+                # than aiming blind and abandoning the run with that menu
+                # still up, which is what the room saw on 2026-09-04.  Both
+                # halves of the evidence are needed: the screen has to have
+                # changed (recognition drops the panel on its own often
+                # enough) *and* the target has to be gone (correctly closing
+                # a menu also changes the screen -- but brings the target
+                # back rather than hiding it).
                 self._press_escape()
                 time.sleep(max(0.4, self.poll_seconds * 2.0))
+                after_escape = self._capture()
+                if (
+                    after_escape is not None
+                    and self._frame_motion(frame, after_escape) >= 0.02
+                    and target(self._detect(after_escape)) is None
+                ):
+                    self._press_escape()
+                    time.sleep(max(0.4, self.poll_seconds * 2.0))
+                    _state(
+                        self.state_callback,
+                        presentationConsoleMenuOpened=menu_dismissals,
+                    )
                 self._aim_probe = self._AIM_PROBE_START
                 measure_point = None
                 pending_command = (0.0, 0.0)
@@ -5019,11 +5223,13 @@ class SlidenConsoleController:
         band_index = 0
         band_started = 0.0
         best_confidence = 0.0
+        last_frame: RGBImage | None = None
         try:
             while time.monotonic() < deadline:
                 _check_cancel(self.cancelled)
                 frame = self._capture()
                 if frame is not None:
+                    last_frame = frame
                     observation = self._detect(frame)
                     best_confidence = max(best_confidence, observation.confidence)
                     _state(
@@ -5049,6 +5255,13 @@ class SlidenConsoleController:
         finally:
             if self._pitch_offset != entry_pitch:
                 self._set_pitch(entry_pitch)
+        if last_frame is not None:
+            # The frame that was still not recognized is the only
+            # evidence a timeout leaves behind.
+            self._save_diagnostic(
+                "timeout-" + description.lower().replace(" ", "-"),
+                last_frame, None, None, None,
+            )
         raise SlidenConsoleNotFound(
             f"timed out while recognizing {description}; "
             f"best confidence was {best_confidence:.2f}"
@@ -5106,6 +5319,97 @@ class SlidenConsoleController:
         except SlidenCancelled:
             raise
         return observation
+
+    def _press_enter(self) -> None:
+        """Enter, to the dialog VRChat is showing (the arrow's keyboard twin)."""
+
+        _check_cancel(self.cancelled)
+        if self._enter_callback is not None:
+            self._enter_callback()
+            return
+        import vrcpilot
+
+        vrcpilot.keyboard.press(vrcpilot.Key.ENTER, focus=False, pid=self.pid)
+
+    def _modal_field_text(self, frame: RGBImage, input_point: Point) -> str | None:
+        """What the URL dialog's field shows, by OCR; None without a locator."""
+
+        if self._text_locator is None:
+            return None
+        try:
+            boxes = list(self._text_locator(frame))
+        except Exception:
+            return None
+        height, width = frame.shape[:2]
+        left, right = input_point[0] - 0.30 * width, input_point[0] + 0.30 * width
+        top, bottom = input_point[1] - 0.06 * height, input_point[1] + 0.06 * height
+        texts = [
+            text for text, rect in boxes
+            if left <= rect.center[0] <= right and top <= rect.center[1] <= bottom
+        ]
+        return " ".join(texts)
+
+    #: Seconds the URL dialog may stay open after the arrow before the entry
+    #: is repeated, and how many entries are made before giving up.
+    _SUBMIT_RETRY_SECONDS = 4.0
+    _SUBMIT_ATTEMPTS = 4
+
+    def _enter_modal_url(
+        self, observation: SlidenConsoleObservation, url: str, attempt: int
+    ) -> None:
+        """Clear the open URL dialog's field, paste *url* into it and submit.
+
+        Each step is followed by a short settle: the sequence used to run
+        clear-click / field-click / Ctrl+A / Ctrl+V / arrow-click back to
+        back, and a live run (2026-09-03) ended with the dialog still open
+        60 seconds after the arrow.  Where OCR is available the field is
+        read back before the arrow, and pasted again if the URL is not in
+        it.  From the second attempt on, Enter backs up the arrow click.
+        """
+
+        clear_method = "keyboard"
+        if observation.modal_clear is not None:
+            _state(self.state_callback, presentationPhase="clearing_console_url")
+            self._click_ui(observation.modal_clear)
+            clear_method = "clear_button+keyboard"
+            time.sleep(max(0.12, self.poll_seconds))
+        _state(
+            self.state_callback,
+            presentationConsoleClearDetected=observation.modal_clear is not None,
+            presentationConsoleClearMethod=clear_method,
+            presentationConsoleSubmitAttempt=attempt,
+        )
+        self._click_ui(observation.modal_input)
+        time.sleep(max(0.12, self.poll_seconds))
+        self._clear_input_text()
+        time.sleep(max(0.08, self.poll_seconds))
+        self._paste(url)
+        # Let the field render the pasted text before it is read or submitted.
+        time.sleep(max(0.20, self.poll_seconds))
+        frame = self._capture()
+        field_text: str | None = None
+        if frame is not None:
+            field_text = self._modal_field_text(frame, observation.modal_input)
+            self._save_diagnostic(f"modal-before-submit-{attempt}", frame, None, None, None)
+        pasted = _url_pasted(field_text, url)
+        _state(
+            self.state_callback,
+            presentationConsoleFieldText=field_text,
+            presentationConsoleFieldVerified=pasted,
+        )
+        if pasted is False:
+            # The field does not show the URL: the paste raced the dialog.
+            # Once more, from the field, before the arrow.
+            self._click_ui(observation.modal_input)
+            time.sleep(max(0.12, self.poll_seconds))
+            self._clear_input_text()
+            time.sleep(max(0.08, self.poll_seconds))
+            self._paste(url)
+            time.sleep(max(0.20, self.poll_seconds))
+        self._click_ui(observation.modal_submit)
+        if attempt >= 2:
+            time.sleep(max(0.15, self.poll_seconds))
+            self._press_enter()
 
     def configure_url(self, url: str) -> SlidenConsoleObservation:
         """Recognize the console, open its URL dialog, paste, and submit."""
@@ -5182,21 +5486,8 @@ class SlidenConsoleController:
                 "and a submit button"
             )
         _state(self.state_callback, presentationConsoleInputMode="menu_ui")
-        clear_method = "keyboard"
-        if observation.modal_clear is not None:
-            _state(self.state_callback, presentationPhase="clearing_console_url")
-            self._click_ui(observation.modal_clear)
-            clear_method = "clear_button+keyboard"
-            time.sleep(max(0.08, self.poll_seconds))
-        _state(
-            self.state_callback,
-            presentationConsoleClearDetected=observation.modal_clear is not None,
-            presentationConsoleClearMethod=clear_method,
-        )
-        self._click_ui(observation.modal_input)
-        self._clear_input_text()
-        self._paste(url)
-        self._click_ui(observation.modal_submit)
+        attempt = 1
+        self._enter_modal_url(observation, url, attempt)
         _state(self.state_callback, presentationPhase="loading_console_url")
         # Submitting hands the URL to the world, which then fetches and
         # buffers the video itself.  That wait is a download, not a
@@ -5208,12 +5499,54 @@ class SlidenConsoleController:
         # deck read as a failed load whenever the button row happened to be
         # out of frame or unresolved, and the URL entry that had just
         # succeeded was reported as a timeout.
-        _frame, ready = self._wait_for(
-            lambda item: not item.modal_open and item.slide_quad is not None,
-            "the loaded Sliden console",
-            timeout_seconds=max(self.timeout_seconds, 60.0),
+        # A dialog that is *still open* seconds after the arrow is the other
+        # failure (live 2026-09-03: "modal open" for the whole minute, and
+        # nothing to show for it): the entry is made again from a fresh
+        # observation, a few times, before the wait is given up.
+        loaded_deadline = time.monotonic() + max(self.timeout_seconds, 60.0)
+        submitted_at = time.monotonic()
+        best_confidence = 0.0
+        last_frame: RGBImage | None = None
+        last_observation: SlidenConsoleObservation | None = None
+        while time.monotonic() < loaded_deadline:
+            _check_cancel(self.cancelled)
+            frame = self._capture()
+            if frame is None:
+                time.sleep(self.poll_seconds)
+                continue
+            last_frame = frame
+            item = self._detect(frame)
+            last_observation = item
+            best_confidence = max(best_confidence, item.confidence)
+            _state(
+                self.state_callback,
+                presentationConsoleConfidence=item.confidence,
+                presentationConsoleModal=item.modal_open,
+            )
+            if not item.modal_open and item.slide_quad is not None:
+                return item
+            if (
+                item.modal_open
+                and time.monotonic() - submitted_at >= self._SUBMIT_RETRY_SECONDS
+                and attempt < self._SUBMIT_ATTEMPTS
+            ):
+                self._save_diagnostic(f"modal-still-open-{attempt}", frame, None, None, None)
+                attempt += 1
+                self._enter_modal_url(item, url, attempt)
+                submitted_at = time.monotonic()
+                continue
+            time.sleep(self.poll_seconds)
+        if last_frame is not None:
+            self._save_diagnostic("loaded-timeout", last_frame, None, None, None)
+        if last_observation is not None and last_observation.modal_open:
+            raise SlidenConsoleNotFound(
+                "timed out while recognizing the loaded Sliden console; the URL "
+                f"dialog was still open after {attempt} submit attempt(s)"
+            )
+        raise SlidenConsoleNotFound(
+            "timed out while recognizing the loaded Sliden console; "
+            f"best confidence was {best_confidence:.2f}"
         )
-        return ready
 
     #: Clearance the console's URL bar needs above the reticle before a
     #: bottom-row button can be aimed at.

@@ -79,6 +79,18 @@ GRAMMAR = [
     *GREETING_GRAMMAR,
     "[unk]",
 ]
+#: Words that interrupt a talk in the "特定ワード" question mode
+#: ("質問いいですか", "スライドを戻して", "発表を中断して", "プレゼンを止めて").
+#: All are single tokens in the small-ja vocabulary (graph/words.txt); the
+#: rest of such an utterance decodes to [unk].
+DEFAULT_QUESTION_WORDS = ("質問", "スライド", "プレゼン", "発表")
+#: Stopping a talk must not depend on a model deciding to call a tool (live
+#: 2026-09-19: 「発表を終了してください」 three times, 「止めます」 said, nothing
+#: stopped) nor on the question mode: these are heard during narration in
+#: every mode.  All single tokens in small-ja (graph/words.txt).
+TALK_WORDS = ("発表", "プレゼン")
+STOP_WORDS = ("終了", "中止", "打ち切り", "終わり", "やめ")
+PAUSE_WORDS = ("停止", "中断", "止め")
 JOIN_PHRASES = ("会話に参加",)
 LEAVE_PHRASES = ("会話から離脱",)
 #: Compact (whitespace-free) forms of the greetings above, plus the spellings
@@ -159,17 +171,65 @@ def install_model(
     return target
 
 
-def classify_text(text: str) -> str | None:
-    """Map a grammar-restricted transcript onto ``join``/``leave``/``greeting``."""
+def grammar_for(question_words: Any = DEFAULT_QUESTION_WORDS) -> list[str]:
+    """The recogniser grammar: the fixed phrases plus the interrupt words."""
+
+    extra = [
+        " ".join(str(word).split())
+        for word in (question_words or ())
+        if str(word).strip()
+    ]
+    body = [phrase for phrase in GRAMMAR if phrase != "[unk]"]
+    extra += [w for w in TALK_WORDS + STOP_WORDS + PAUSE_WORDS if w not in extra]
+    return body + [word for word in extra if word not in body] + ["[unk]"]
+
+
+def control_action(text: str) -> str | None:
+    """"stop" / "pause" when a grammar-restricted transcript asks the talk to
+    stop: the talk itself named (発表 / プレゼン) together with a stop or pause
+    word.  A pause word alone is not enough -- 「止め」 turns up in chatter."""
+
+    compact = "".join(ch for ch in str(text) if not ch.isspace())
+    if not any(word in compact for word in TALK_WORDS):
+        return None
+    if any(word in compact for word in STOP_WORDS):
+        return "stop"
+    if any(word in compact for word in PAUSE_WORDS):
+        return "pause"
+    return None
+
+
+def classify_text(
+    text: str, question_words: Any = DEFAULT_QUESTION_WORDS
+) -> str | None:
+    """Map a grammar-restricted transcript onto an action.
+
+    ``leave`` / ``join`` first, then ``question`` (an interrupt word), then
+    ``greeting``: "すみません、質問いいですか" is a question during a talk.
+    The bridge treats a question that also carries a greeting as the greeting
+    whenever no talk is listening for interruptions.
+    """
 
     compact = "".join(ch for ch in str(text) if not ch.isspace())
     if any(phrase in compact for phrase in LEAVE_PHRASES):
         return "leave"
     if any(phrase in compact for phrase in JOIN_PHRASES):
         return "join"
+    if control_action(compact) is not None:
+        return "control"
+    words = [
+        "".join(str(word).split()) for word in (question_words or ()) if str(word).strip()
+    ]
+    if any(word in compact for word in words):
+        return "question"
     if any(phrase in compact for phrase in GREETING_PHRASES):
         return "greeting"
     return None
+
+
+def has_greeting(text: str) -> bool:
+    compact = "".join(ch for ch in str(text) if not ch.isspace())
+    return any(phrase in compact for phrase in GREETING_PHRASES)
 
 
 def downmix_to_16k(chunk: NDArray[np.float32], input_rate: int) -> NDArray[np.int16]:
@@ -207,8 +267,14 @@ class VoiceCommandSpotter:
         flush_silence_seconds: float = 0.7,
         state_callback: Callable[..., None] | None = None,
         recognizer_factory: Callable[[], Any] | None = None,
+        question_words: Any = DEFAULT_QUESTION_WORDS,
     ) -> None:
         self.on_command = on_command
+        self.question_words = tuple(
+            " ".join(str(word).split())
+            for word in (question_words or ())
+            if str(word).strip()
+        )
         self.model_dir = Path(model_dir) if model_dir else default_model_directory()
         self.auto_download = auto_download
         self.input_rate = int(input_rate)
@@ -231,7 +297,9 @@ class VoiceCommandSpotter:
         self.suppressed_until = 0.0
         self.last_command_at = 0.0
         self.last_greeting_at = 0.0
+        self.last_question_at = 0.0
         self.last_text = ""
+        self.last_text_at = 0.0
         self.dropped_chunks = 0
         self.status = "idle"
         self.lock = threading.Lock()
@@ -284,7 +352,11 @@ class VoiceCommandSpotter:
 
         SetLogLevel(-1)
         model = Model(str(self.model_dir))
-        recognizer = KaldiRecognizer(model, SAMPLE_RATE, json.dumps(GRAMMAR, ensure_ascii=False))
+        recognizer = KaldiRecognizer(
+            model,
+            SAMPLE_RATE,
+            json.dumps(grammar_for(self.question_words), ensure_ascii=False),
+        )
         recognizer.SetWords(True)
         return recognizer
 
@@ -383,8 +455,13 @@ class VoiceCommandSpotter:
         ]
         confidence = min(confidences) if confidences else 1.0
         self.last_text = text
-        self._report(voiceCommandLastText=text, voiceCommandLastAt=time.time())
-        action = classify_text(text)
+        #: Wall-clock of the last recognised utterance.  Callers use it to ask
+        #: "has the room said anything since ...?" -- which is a different
+        #: question from "did the VAD fire?", and the only one that separates
+        #: a spoken question from a noise in the room.
+        self.last_text_at = time.time()
+        self._report(voiceCommandLastText=text, voiceCommandLastAt=self.last_text_at)
+        action = classify_text(text, self.question_words)
         if action is None:
             return
         now = time.monotonic()
@@ -394,7 +471,13 @@ class VoiceCommandSpotter:
         with self.lock:
             if now - self.last_command_at < self.cooldown_seconds:
                 return
-            if action != "greeting":
+            if action in ("question", "control"):
+                # Like a greeting, a word the listener may repeat; it must not
+                # hold the join/leave cooldown.
+                if now - self.last_question_at < self.cooldown_seconds:
+                    return
+                self.last_question_at = now
+            elif action != "greeting":
                 # A greeting is a wake word the listener may repeat; only the
                 # join/leave commands hold the shared cooldown.
                 self.last_command_at = now
