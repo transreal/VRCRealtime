@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import threading
@@ -395,6 +396,31 @@ class WorldJoinSpec:
 _LOADING_WORDS = ("loading", "joining", "downloading", "connecting", "pleasewait")
 _LOADING_MIN_HEIGHT_FRACTION = 0.02
 _MENU_MARKERS = ("Selected Instance", "Create New Instance", "Launch Pad", "Respawn")
+#: Mean absolute difference (0-255, per channel) above which the pixels
+#: around a clicked label count as changed.  An unchanged menu differs by
+#: render noise of a few levels; a hover highlight, a selected tab or a new
+#: page differs by tens.
+_PATCH_CHANGE_THRESHOLD = 12.0
+
+
+def _patch_changed(before: RGBImage, after: RGBImage, rect: Rect) -> bool:
+    """Whether the pixels around *rect* differ between two captures.
+
+    Frames of different sizes (the window was resized) count as changed, so
+    that doubt always means "do not click again".
+    """
+
+    if before.shape != after.shape:
+        return True
+    height, width = before.shape[:2]
+    pad_x, pad_y = max(8, rect.height), max(4, rect.height // 2)
+    left, right = max(0, rect.x - pad_x), min(width, rect.right + pad_x)
+    top, bottom = max(0, rect.y - pad_y), min(height, rect.bottom + pad_y)
+    if right <= left or bottom <= top:
+        return True
+    a = before[top:bottom, left:right].astype(np.int16)
+    b = after[top:bottom, left:right].astype(np.int16)
+    return float(np.abs(a - b).mean()) > _PATCH_CHANGE_THRESHOLD
 
 
 class WorldJoinController(SlidenConsoleController):
@@ -437,10 +463,16 @@ class WorldJoinController(SlidenConsoleController):
         self._ocr_engine: Any | None = None
         self.steps: list[str] = []
         self.warnings: list[str] = []
+        self.click_retries: dict[str, int] = {}
         self.last_texts: list[str] = []
         self.frame_size: tuple[int, int] = (0, 0)
         self._shots_written = 0
         self._started = time.monotonic()
+        #: The last frame read by ``_menu_observe``, and the one a click was
+        #: decided on: a dropped click is recognised by comparing the two.
+        self._observed_frame: RGBImage | None = None
+        self._observed_boxes: list[TextBox] = []
+        self._click_frame: RGBImage | None = None
 
     _SHOT_LIMIT = 120
     #: Menu animation allowance after a click, and the loading-screen poll.
@@ -448,6 +480,14 @@ class WorldJoinController(SlidenConsoleController):
     _SETTLE_SCALE = 1.0
     _LOAD_MINIMUM_SECONDS = 8.0
     _LOAD_POLL_SECONDS = 2.0
+    #: Clicks per menu step before giving up.  VRChat now and then drops a
+    #: menu click altogether -- "Worlds" on 2026-09-19, the "NCG Gallery"
+    #: tile on 2026-10-03 -- and with one click per step the run then waited
+    #: out the whole step timeout in front of an unchanged page.  A click
+    #: that registers shows its page within one or two polls (~3-6 s), so
+    #: the step timeout is split evenly between the attempts.
+    _CLICK_ATTEMPTS = 3
+    _CLICK_RETRY_SECONDS = 7.0
 
     def _settle(self, seconds: float) -> None:
         time.sleep(seconds * self._SETTLE_SCALE)
@@ -494,7 +534,9 @@ class WorldJoinController(SlidenConsoleController):
                     raise WorldJoinError("the VRChat window could not be captured")
                 time.sleep(self.poll_seconds)
         self.frame_size = (int(frame.shape[1]), int(frame.shape[0]))
+        self._observed_frame = frame
         boxes = list(self._ensure_ocr()(frame))
+        self._observed_boxes = boxes
         self.last_texts = [b.text for b in boxes][:60]
         self._state(worldJoinLastTexts=self.last_texts)
         if snapshot:
@@ -609,9 +651,107 @@ class WorldJoinController(SlidenConsoleController):
     ) -> TextHit:
         hit, _boxes = self._menu_wait(label, targets, mode=mode, timeout=timeout, region=region)
         assert hit is not None
+        self._click_frame = self._observed_frame
         self._click_hit(hit, park=park)
         self._settle(settle)
         return hit
+
+    def _menu_click_through(
+        self,
+        label: str,
+        targets: str | Sequence[str],
+        next_label: str,
+        next_targets: str | Sequence[str],
+        *,
+        mode: str = "exact",
+        next_mode: str = "exact",
+        settle: float = 0.8,
+    ) -> tuple[TextHit | None, list[TextBox]]:
+        """Click *targets*, then wait for the page that shows *next_targets*."""
+
+        hit = self._menu_click(label, targets, mode=mode, settle=settle)
+        return self._await_click(
+            hit, label, targets, next_label, next_targets,
+            mode=mode, next_mode=next_mode, settle=settle,
+        )
+
+    def _await_click(
+        self,
+        hit: TextHit,
+        label: str,
+        targets: str | Sequence[str],
+        next_label: str,
+        next_targets: str | Sequence[str],
+        *,
+        mode: str = "exact",
+        next_mode: str = "exact",
+        settle: float = 0.8,
+    ) -> tuple[TextHit | None, list[TextBox]]:
+        """Wait for the result of the click on *hit*, clicking again if it was dropped.
+
+        Only navigation clicks come through here -- pressing the same tab,
+        list or tile twice opens the same page -- and even so a click is
+        repeated only when the page shows no sign of the first one: the
+        expected text is absent and the clicked label is still where it
+        was, over unchanged pixels.  A page that is merely slow to fill
+        changes those pixels (highlight, fade, new layout) and is waited
+        for instead.
+        """
+
+        budget = self.spec.step_timeout
+        deadline = time.monotonic() + budget
+        # Every attempt gets the same share; the last one also whatever is
+        # left of the step timeout, so a slow page is waited for as before.
+        window = min(self._CLICK_RETRY_SECONDS, budget / self._CLICK_ATTEMPTS)
+        clicks = 1
+        while True:
+            last = clicks >= self._CLICK_ATTEMPTS
+            try:
+                return self._menu_wait(
+                    next_label, next_targets, mode=next_mode,
+                    timeout=max(window, deadline - time.monotonic()) if last else window,
+                )
+            except WorldJoinError:
+                if last:
+                    raise
+            clicks += 1
+            again = self._dropped_click(hit, targets, mode)
+            if again is None:
+                # Something moved, so the click did land: keep waiting.
+                continue
+            self._warn(
+                f"{label}: the click on '{hit.text}' showed no effect; clicked again "
+                f"({clicks}/{self._CLICK_ATTEMPTS})"
+            )
+            self.click_retries[label] = clicks - 1
+            self._state(worldJoinClickRetries=dict(self.click_retries))
+            self._click_hit(again)
+            self._settle(settle)
+            hit = again
+
+    def _dropped_click(
+        self, hit: TextHit, targets: str | Sequence[str], mode: str
+    ) -> TextHit | None:
+        """The label to click again when the click on *hit* changed nothing."""
+
+        before, seen = self._click_frame, self._observed_frame
+        if before is None or seen is None:
+            return None
+        again = find_text(self._observed_boxes, targets, mode=mode)
+        if again is None:
+            return None
+        tolerance = max(12.0, 0.75 * hit.rect.height)
+        (x0, y0), (x1, y1) = hit.center, again.center
+        if math.hypot(x1 - x0, y1 - y0) > tolerance:
+            return None
+        if _patch_changed(before, seen, hit.rect):
+            return None
+        # The decision rests on a frame a poll old; look once more, cheaply,
+        # so a page that started to change during the OCR is not clicked on.
+        now = self._capture()
+        if now is None or _patch_changed(before, now, hit.rect):
+            return None
+        return again
 
     def _click_hit(self, hit: TextHit, *, park: bool = True) -> None:
         x, y = hit.center
@@ -670,13 +810,12 @@ class WorldJoinController(SlidenConsoleController):
 
     def open_worlds(self) -> None:
         self._phase("opening_worlds")
-        self._menu_click("worlds", "Worlds")
         # Sidebar labels that only the Worlds page has.  Exact on purpose: a
         # fuzzy "My Worlds" is satisfied by the bottom bar's "Worlds", which
         # is on every page.
-        self._menu_wait(
-            "worlds_page",
-            ["Search Worlds", "Recently Visited", "My Worlds", "Uploaded"],
+        self._menu_click_through(
+            "worlds", "Worlds",
+            "worlds_page", ["Search Worlds", "Recently Visited", "My Worlds", "Uploaded"],
         )
         self._done_step("worlds")
 
@@ -687,7 +826,7 @@ class WorldJoinController(SlidenConsoleController):
         # list names are not on screen at all: open the section first.
         for attempt in range(3):
             try:
-                self._menu_click(
+                hit = self._menu_click(
                     "favorites", self.spec.favorites, mode="fuzzy",
                     timeout=min(4.0, self.spec.step_timeout) if attempt < 2 else None,
                 )
@@ -702,27 +841,37 @@ class WorldJoinController(SlidenConsoleController):
                 self._state(worldJoinMyWorldsExpanded=attempt + 1)
                 self._click_hit(section)
                 self._settle(0.9)
-        self._menu_wait("favorites_grid", self.spec.world, mode="fuzzy")
+        # Outside the loop on purpose: a list that is slow to show its tiles
+        # is no reason to toggle the "My Worlds" section shut again.
+        self._await_click(
+            hit, "favorites", self.spec.favorites,
+            "favorites_grid", self.spec.world, mode="fuzzy", next_mode="fuzzy",
+        )
         self._done_step("favorites")
 
     def select_world(self) -> None:
         self._phase("selecting_world")
-        self._menu_click("world", self.spec.world, mode="fuzzy")
-        self._menu_wait("world_page", "New Instance")
+        # The world page repeats the world's name as its title, but elsewhere
+        # than the tile, so it is never mistaken for a tile that ignored the
+        # click.
+        self._menu_click_through(
+            "world", self.spec.world, "world_page", "New Instance", mode="fuzzy"
+        )
         self._done_step("world")
 
     def open_new_instance(self) -> None:
         self._phase("opening_new_instance")
-        self._menu_click("new_instance", "New Instance")
-        self._menu_wait("instance_dialog", ["Create New Instance", "Instance Type"])
+        self._menu_click_through(
+            "new_instance", "New Instance",
+            "instance_dialog", ["Create New Instance", "Instance Type"],
+        )
         self._done_step("new_instance")
 
     def choose_group_type(self) -> None:
         self._phase("choosing_group_type")
         # Exact on purpose: the bottom bar says "Groups" and the row's own
         # description says "owned by a group".
-        self._menu_click("group_type", "Group")
-        self._menu_wait("group_dialog", "Create Instance")
+        self._menu_click_through("group_type", "Group", "group_dialog", "Create Instance")
         self._done_step("group_type")
 
     def verify_group_settings(self) -> dict[str, Any]:

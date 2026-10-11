@@ -1034,7 +1034,10 @@ def _detect_modal(
     stats = _channel_stats(image) if stats is None else stats
     # The input well is nearly black while the enclosing modal is dark blue.
     # Keeping this threshold deliberately low prevents both regions from
-    # merging into one contour.
+    # merging into one contour.  It is also close to the limit both ways: the
+    # "Enter URL" dialog of 2026-10-03 has a well of max channel 28 (the older
+    # "URL を入力" one, 18), and from 33 up the Home world's dark furniture
+    # starts to pass for a dialog (4-5 of 765 world-join frames).
     dark = cv2.bitwise_and(
         _at_most(stats.maximum, 30),
         _at_most(cv2.subtract(stats.maximum, stats.minimum), 25),
@@ -1049,7 +1052,11 @@ def _detect_modal(
     for rect, _contour in _contour_rectangles(dark):
         aspect = rect.width / rect.height
         area = rect.width * rect.height
-        if not (4.0 <= aspect <= 12.0):
+        # The older dialog's well was about 6.6:1; the current one is a thin
+        # strip of 12.8:1 (770 x 60 at 1942 x 1136), which the old ceiling of
+        # 12 rejected -- the click opened the dialog, and the run, seeing no
+        # dialog, aimed at a URL bar the dialog now hid and gave up.
+        if not (4.0 <= aspect <= 18.0):
             continue
         if not (0.008 * frame_area <= area <= 0.10 * frame_area):
             continue
