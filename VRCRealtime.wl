@@ -58,7 +58,8 @@ VRCRealtimeStartPresentation::usage =
   "VRCRealtimeStartPresentation[url] は Sliden の MP4 を取得・展開し、操作パネルへ URL を入力して各スライドを元解像度で自動発表する。\n" <>
   "\"NavigateToConsole\" は既定 Automatic: まず今いる場所から操作パネルが使えるか確認し、使えるならそのまま開始する。使えないときだけ部屋の中でパネルを探して前まで移動してから開始する。判定は URL 入力欄のある操作パネルが見えるか (configure_url が待つ条件と同一) で、頭の上下だけの位置ずれは「見えている」に含む。\n" <>
   "\"NavigateToConsole\" -> True は常に探索してから開始、False は探索しない (パネルの前にいなければ失敗する従来の挙動)。\n" <>
-  "VRCRealtimeStartPresentation[\"\:8a08\:7b97\:3068\:81ea\:713631\"] のように登録済みの発表タイトルでも開始できる。タイトル・スライド URL・発表シナリオ (原稿) は SourceVault の発表登録簿 (SlideWorkflow パレットの「登録」) から引く。原稿があればそれを話し、無ければ従来どおり 1 枚ごとの画像説明になる。\"Talk\" -> None で原稿を使わない。";
+  "VRCRealtimeStartPresentation[\"\:8a08\:7b97\:3068\:81ea\:713631\"] のように登録済みの発表タイトルでも開始できる。タイトル・スライド URL・発表シナリオ (原稿) は SourceVault の発表登録簿 (SlideWorkflow パレットの「登録」) から引く。原稿があればそれを話し、無ければ従来どおり 1 枚ごとの画像説明になる。\"Talk\" -> None で原稿を使わない。\n" <>
+  "登録簿の照合は呼び名 (SlideWorkflow の指示セル Aliases: / 呼び名:) を題名より優先する。\"Format\" -> \"Poster\" (登録簿に SlideURL が無く PosterURL だけなら Automatic でもポスター) は、掲示済みのポスターをポスター原稿 (登録簿の posterTalk、無ければスライド原稿) で段落ごとに説明するポスター発表。操作パネルへは行かず、スライドも送らない。質疑の窓は段落の切れ目と最後に開く。";
 
 VRCRealtimeListPresentations::usage =
   "VRCRealtimeListPresentations[] は SourceVault の発表登録簿に登録済みの発表 (タイトル / スライド URL / 枚数) を返す。";
@@ -1553,6 +1554,11 @@ Options[VRCRealtimeStartPresentation] = {
   "NarrationInstructions" -> Automatic,
   "Talk" -> Automatic,
   "Title" -> Automatic,
+  (* 発表の形。Automatic = 登録簿に Sliden 用 mp4 (SlideURL) があればスライド、ポスター PDF
+     (PosterURL) だけならポスター。"Poster" = 掲示済みのポスターをポスター原稿で説明する
+     (Sliden の操作パネルへは行かず、スライドも送らない。原稿は登録簿の posterTalk、無ければ
+     スライド原稿)。"Slides" = 従来のスライド発表。 *)
+  "Format" -> Automatic,
   (* スライド切り替え時に開く質疑応答の秒数。0 で質疑応答なし *)
   "QuestionSeconds" -> 5.,
   (* 全スライド終了後の質疑応答の上限秒数 (無音でこの時間が過ぎたら終了) *)
@@ -1571,7 +1577,8 @@ VRCRealtimeStartPresentation[
     OptionsPattern[]] := Module[
   {value, urlGiven, spec, url, title, seconds, consoleTimeout, navigate, mcpService,
    navigationTimeout, downloadTimeout, maxMB, start, end, narration, talk,
-   questionSeconds, finalQuestionSeconds, questionMode, result},
+   questionSeconds, finalQuestionSeconds, questionMode, result,
+   format, purl, hasSlides, hasPoster, posterTalk, talkSource},
   value = StringTrim[target];
   questionMode = Replace[OptionValue["QuestionMode"],
     m : Except[Automatic] :> iQuestionModeWire[m]];
@@ -1598,7 +1605,24 @@ VRCRealtimeStartPresentation[
         <|"Query" -> value|>]]];
     url = ToString @ Lookup[spec, "url", ""],
     url = value];
-  If[!AnyTrue[{"http://", "https://"}, StringStartsQ[url, #] &],
+  (* 発表の形: スライド (Sliden 用 mp4) か ポスター (掲示済みのポスターを原稿で説明)。
+     指定された形の材料が無ければもう一方 (mp4 だけの発表はポスターにできず、ポスターだけの
+     発表はスライドにできない)。 *)
+  purl = If[AssociationQ[spec], StringTrim @ ToString @ Lookup[spec, "posterUrl", ""], ""];
+  posterTalk = If[AssociationQ[spec], Lookup[spec, "posterTalk", Null], Null];
+  hasSlides = AnyTrue[{"http://", "https://"}, StringStartsQ[url, #] &];
+  hasPoster = AnyTrue[{"http://", "https://"}, StringStartsQ[purl, #] &] || AssociationQ[posterTalk];
+  format = Replace[OptionValue["Format"], {"poster" -> "Poster", "slides" -> "Slides"}];
+  If[!MemberQ[{Automatic, "Slides", "Poster"}, format],
+    Return[iFailure["InvalidPresentationFormat",
+      "\"Format\" must be Automatic, \"Slides\" or \"Poster\"."]]];
+  format = Which[
+    format === "Poster" && hasPoster, "Poster",
+    format === "Slides" && hasSlides, "Slides",
+    hasSlides, "Slides",
+    hasPoster, "Poster",
+    True, "Slides"];
+  If[format === "Slides" && !hasSlides,
     Return[iFailure["InvalidSlideURL",
       "Slide URL must be an absolute HTTP or HTTPS URL."]]];
 
@@ -1622,12 +1646,21 @@ VRCRealtimeStartPresentation[
       url === VRCRealtime`$VRCRealtimeDefaultSlideURL, "計算と自然31",
       True, Null]];
   talk = OptionValue["Talk"];
+  talkSource = "slides";
   talk = Which[
     talk === None, Null,
     talk === Automatic,
       If[AssociationQ[spec] && !TrueQ[Lookup[spec, "talkWithheld", False]],
-        iNormalizeTalkPayload[Lookup[spec, "talk", Null]], Null],
+        (* ポスター発表はポスター原稿 (posterTalk)。無ければスライド原稿をスライド無しで読む *)
+        If[format === "Poster" && AssociationQ[posterTalk],
+          talkSource = "poster"; iNormalizeTalkPayload[posterTalk],
+          iNormalizeTalkPayload[Lookup[spec, "talk", Null]]],
+        Null],
     True, iNormalizeTalkPayload[talk]];
+  If[format === "Poster" && talk === Null,
+    Return[iFailure["PosterTalkMissing",
+      "ポスター発表には原稿が必要です。SlideWorkflow でポスター原稿を作り「登録」してください。",
+      <|"Query" -> value|>]]];
 
   questionSeconds = OptionValue["QuestionSeconds"];
   finalQuestionSeconds = OptionValue["FinalQuestionSeconds"];
@@ -1664,11 +1697,15 @@ VRCRealtimeStartPresentation[
   ];
   result = iSendCommand[<|
     "command" -> "presentation-start",
+    "format" -> ToLowerCase[format],
     "url" -> url,
+    "posterUrl" -> purl,
+    "talkSource" -> talkSource,
     "secondsPerSlide" -> N[seconds],
     "consoleTimeoutSeconds" -> N[consoleTimeout],
-    "navigateToConsole" -> Replace[navigate, {Automatic -> "auto",
-      True -> "always", False -> "never"}],
+    (* ポスター発表には操作パネルが無い *)
+    "navigateToConsole" -> If[format === "Poster", "never",
+      Replace[navigate, {Automatic -> "auto", True -> "always", False -> "never"}]],
     "navigationTimeoutSeconds" -> N[navigationTimeout],
     "activatePresentationMode" -> True,
     "presentationTitle" -> title,
@@ -1687,8 +1724,9 @@ VRCRealtimeStartPresentation[
     "questionMode" -> Replace[questionMode, Automatic -> Null]
   |>];
   If[AssociationQ[result],
-    $iSession["PresentationURL"] = url;
+    $iSession["PresentationURL"] = If[format === "Poster" && url === "", purl, url];
     $iSession["PresentationTitle"] = title;
+    $iSession["PresentationFormat"] = format;
     $iSession["PresentationScripted"] = AssociationQ[talk];
     $iSession["PresentationStartedAt"] = Now
   ];

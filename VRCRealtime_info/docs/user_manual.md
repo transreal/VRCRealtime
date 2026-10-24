@@ -157,13 +157,35 @@ VRCRealtimeInstallVoiceCommandModel[]
 
 ### `VRCRealtimeStartPresentation[target]`
 
-Sliden の MP4 を取得・展開し、操作パネルへ URL を入力して各スライドを自動発表します。`target` には URL か登録済みの発表タイトルを渡せます。登録簿に発表原稿があればそれを話し、無ければ 1 枚ごとの画像説明になります。主なオプションは `"NavigateToConsole"`（既定 Automatic：使える位置ならそのまま開始、使えなければ探索）、`"StartSlide"` / `"EndSlide"`、`"Talk"`（None で原稿を使わない）、`"QuestionSeconds"`（既定 5 秒。各スライドの切れ目で待つ質疑応答の秒数）、`"FinalQuestionSeconds"`（既定 120 秒。全スライド終了後の質疑応答で、無音のままこの秒数が経過すると発表を終了する上限）。
+Sliden の MP4 を取得・展開し、操作パネルへ URL を入力して各スライドを自動発表します。`target` には URL か登録済みの発表タイトルを渡せます。登録簿に発表原稿があればそれを話し、無ければ 1 枚ごとの画像説明になります。主なオプションは `"NavigateToConsole"`（既定 Automatic：使える位置ならそのまま開始、使えなければ探索）、`"StartSlide"` / `"EndSlide"`、`"Talk"`（None で原稿を使わない）、`"Format"`（既定 Automatic。発表の形で、`Automatic` | `"Slides"` | `"Poster"`。下の「ポスター発表」参照）、`"QuestionSeconds"`（既定 5 秒。各スライドの切れ目で待つ質疑応答の秒数）、`"FinalQuestionSeconds"`（既定 120 秒。全スライド終了後の質疑応答で、無音のままこの秒数が経過すると発表を終了する上限）。
 
 ```wolfram
 VRCRealtimeStartPresentation["計算と自然と31"]
 ```
 
 発表タイトル・スライド URL・発表原稿は SourceVault の発表登録簿へ MCP サービス越しに照合します。開始前にこのサービスの command queue が応答するかを確認しており、保守処理中などで数秒以内に応答しない場合は登録簿を引けず、原稿だけが静かに落ちて画像説明に縮退することを防ぐため発表を開始しません。その場合は少し時間をおいてから再度試してください。
+
+照合は登録簿の**呼び名**(SlideWorkflow の指示セル `Aliases:` / `呼び名:` 行)を題名より優先します。題名が長い発表でも、呼び名が依頼文に丸ごと含まれていればその発表が始まります(例: 呼び名 `CIHCD 2026` を登録しておけば、音声の「CIHCD 2026 のポスター発表を始めて」や `VRCRealtimeStartPresentation["CIHCD 2026"]` で始まる)。呼び名で見つからないときだけ題名で近いものを探します。
+
+### ポスター発表
+
+発表の形は `"Format"` オプションで選びます。
+
+- `Automatic`(既定)— 登録簿に `SlideURL`(Sliden 用 mp4)があればスライド、`PosterURL`(ポスター PDF)だけならポスターになります。
+- `"Slides"` — 従来のスライド発表です。
+- `"Poster"` — 掲示済みのポスターをポスター原稿で説明するポスター発表です。
+
+両方ある発表は既定でスライドです。ポスターで始めたいときは、音声で「〜のポスター発表を始めて」と言うか `"Format" -> "Poster"` を指定します。指定された形の材料が無ければ、もう一方になります。ただし mp4 だけの発表はポスターにできず、ポスターだけの発表はスライドにできません。`"Format"` に上記以外を渡すと `InvalidPresentationFormat` で失敗します。
+
+ポスターはワールドにあらかじめ掲示されている前提で、操作パネルへは行かず(内部的に `NavigateToConsole` は常に行われません)、スライドも送りません。アバターは登録簿のポスター原稿(SlideWorkflow の「ポスター原稿」= `posterTalk`。無ければスライド原稿)を、前置き → 段落(原稿のある枚ごと) → 締めの順に読み、段落の切れ目では `"QuestionSeconds"`、最後に `"FinalQuestionSeconds"` の質疑を受けます。ポスター原稿もスライド原稿も無い場合は `PosterTalkMissing` で失敗します。その場合は SlideWorkflow でポスター原稿を作り「登録」してください。質疑中の `show_slide`(スライドの呼び戻し)はポスター発表では使えません。
+
+状態は `VRCRealtimePresentationStatus[]` で確認できます。`presentationFormat` が `"poster"`(スライドなら `"slides"`)、`presentationBlocks` が原稿のあるデッキ上の枚番号、`presentationCurrentBlock` が読んでいる枚です。また、どちらの原稿を使ったかは `talkSource`(`"poster"` | `"slides"`)に記録されます。
+
+```wolfram
+VRCRealtimeStartPresentation["CIHCD 2026"]                      (* 登録簿が poster なら自動でポスター発表 *)
+VRCRealtimeStartPresentation["三蔵祭 2026", "Format" -> "Poster"]  (* mp4 もあるデッキをポスターとして *)
+VRCRealtimeStartPresentation["三蔵祭 2026", "Format" -> "Slides"]  (* ポスターもあるデッキをスライドとして *)
+```
 
 スライドの切れ目では `"QuestionSeconds"`(既定 5 秒)だけ待ちます。この間アバターは
 **何も話しません**。「質問はありますか」と口頭で促すことはせず、チャットボックスに
@@ -243,7 +265,7 @@ VRCRealtimeStopPresentation[]
 
 どのモードでも、スライドの切れ目ではチャットボックスに「質問があればどうぞ」と出して
 `"QuestionSeconds"`（既定 5 秒）待ちます。説明を聞き終えてから質問できるようにするためです。VRChat の部屋の音にはアバター自身の声は入らないため、
-発表中に聞き耳を立ててもエコーの心配はありません。
+発表中に聞き耳を立ててもエコーの心配はありません。ポスター発表では、この質疑の窓は段落の切れ目と最後に開きます。
 
 ```wolfram
 VRCRealtimeSetQuestionMode["Keywords"]

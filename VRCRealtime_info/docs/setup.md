@@ -18,7 +18,7 @@ macOS/Linux ではパス区切りやシェルコマンドを適宜読み替え�
 
 - **NBAccess.wl（必須）**: OpenAI の API キー取得・アクセス許可判定に使用します。`$packageDirectory` 直下に配置してください。無いと `VRCRealtimeStart[]` は `"NBAccessUnavailable"` で失敗します。
 - **SourceVault_voice.wl（任意）**: ローカル音声合成（Piper / AivisSpeech）ランタイムと声モデルを管轄します。解決した声が AivisSpeech のものであれば、エンジンの応答確認が取れた場合に限り AivisSpeech エンジンが自動採用され、応答しなければ Piper の声へ自動的に切り替わります（どちらかが動けば読み上げは継続します）。無い場合は `VRCRealtime` が旧配置（`SourceVault_voice/` または `VRCRealtime_tts/` 配下）を自前で探索するフォールバックが働きますが、資産が見つからなければローカル読み上げ機能（非公開資料の音声応答）が無効になります。
-- **SourceVault.wl（任意）**: 発表登録簿（スライド URL・発表原稿）と資料検索（`sourcevault_lookup`）を MCP サービス越しに提供します。無くても `VRCRealtimeStartPresentation` に URL を直接渡せば動作しますが、タイトル指定や原稿付き発表はできません。SourceVault MCP サービスが停止している場合は `VRCRealtimeStartPresentation` が起動を試み、保守 tick の実行中で command queue が応答しない場合は数分待ってから再試行が必要です（詳細は「8. トラブルシューティング」参照）。
+- **SourceVault.wl（任意）**: 発表登録簿（スライド URL・ポスター URL・発表原稿・ポスター原稿）と資料検索（`sourcevault_lookup`）を MCP サービス越しに提供します。無くても `VRCRealtimeStartPresentation` に URL を直接渡せば動作しますが、タイトル指定や原稿付き発表、ポスター発表はできません。SourceVault MCP サービスが停止している場合は `VRCRealtimeStartPresentation` が起動を試み、保守 tick の実行中で command queue が応答しない場合は数分待ってから再試行が必要です（詳細は「8. トラブルシューティング」参照）。
 
 ## 3. インストール手順
 
@@ -118,6 +118,22 @@ VRCRealtimeListPresentations[]
 VRCRealtimeStartPresentation["https://example.com/slides.mp4"]
 ```
 
+登録済みの発表タイトル（例: `VRCRealtimeStartPresentation["計算と自然31"]`）でも開始できます。タイトル・スライド URL・発表原稿は SourceVault の発表登録簿（SlideWorkflow パレットの「登録」）から引かれ、原稿があればそれを話し、無ければ 1 枚ごとの画像説明になります（`"Talk" -> None` で原稿を使わない）。登録簿の照合は、SlideWorkflow の指示セルに書いた呼び名（`Aliases:` / `呼び名:`）を題名より優先します。
+
+### 発表の形（スライド / ポスター）
+
+`VRCRealtimeStartPresentation` の `"Format"` オプションで、発表の形を選べます（既定 `Automatic`）。
+
+- `Automatic`: 登録簿に Sliden 用 mp4（SlideURL）があればスライド発表、ポスター PDF（PosterURL）だけならポスター発表になります。
+- `"Slides"`: 従来のスライド発表です。
+- `"Poster"`: 掲示済みのポスターを、ポスター原稿（登録簿の `posterTalk`。無ければスライド原稿）で段落ごとに説明するポスター発表です。Sliden の操作パネルへは行かず（`NavigateToConsole` に関わらず移動しません）、スライドも送りません。質疑の窓は段落の切れ目と最後に開きます。
+
+指定した形の材料が無ければ、もう一方の形になります（mp4 だけの発表はポスターにできず、ポスターだけの発表はスライドにできません）。ポスター発表には原稿が必要で、原稿が無い場合は `"PosterTalkMissing"` の `Failure` になります。SlideWorkflow でポスター原稿を作り「登録」してください。`"Format"` に不正な値を渡すと `"InvalidPresentationFormat"` で失敗します。
+
+```wolfram
+VRCRealtimeStartPresentation["計算と自然31", "Format" -> "Poster"]
+```
+
 発表中は `VRCRealtimePresentationControl["Pause"|"Resume"|"Stop"|"ResumeHere"|"ResumeBack"]` で制御できます。質疑応答中にスライドを動かした場合、発表側が「表示中のスライドから続けるか、元の位置へ戻るか」を尋ねてくるので、`"ResumeHere"`（表示中のスライドから続行）または `"ResumeBack"`（発表が進んでいた位置へ戻る）で応答してください。スライドの区切りで開く質疑応答の待ち時間は `VRCRealtimeStartPresentation` の `"QuestionSeconds"`（既定 5 秒）、全スライド終了後の質疑応答の上限は `"FinalQuestionSeconds"`（既定 120 秒）で調整できます。
 
 発表中の質問の受け方は `"QuestionMode"` で切り替えられます（既定 `"QuestionTime"`）。
@@ -141,6 +157,7 @@ VRCRealtimeQuestionMode[]   (* 現在のモードを確認 *)
 - `"Model"`, `"API"`, `"LiveBackendModel"`: 使用するモデルと API 経路。`"API"` は Automatic（モデル名で判定）/ `"Realtime"` / `"Live"`。`"LiveBackendModel"` は GPT-Live 経由時に道具を実行するバックエンドモデル。
 - `"FullDuplex"`: GPT-Live のみ有効。既定 True（発表中以外は話しながら聞く全二重）、False で Realtime と同じ半二重。
 - `"QuestionMode"`, `"InterruptWords"`: 発表中の質問の受け方（`"QuestionTime"` / `"Keywords"` / `"Detect"`）と、`"Keywords"` モードで割り込みに使う語。
+- `"Format"`（`VRCRealtimeStartPresentation`）: 発表の形。`Automatic`（既定）/ `"Slides"` / `"Poster"`。
 - `"InputSource"`, `"InputDevice"`, `"OutputDevice"`: 音声入出力デバイス。
 - `"OSCHost"`, `"OSCPort"`: VRChat OSC 接続先。
 - `"VisualAttentionGate"`, `"VisualGateMinFaceFraction"` など: 視覚ゲート（正面から話しかけられたときのみ応答）の調整。
@@ -153,6 +170,8 @@ VRCRealtimeQuestionMode[]   (* 現在のモードを確認 *)
 - `"UVNotFound"`: `uv.exe` の場所を `"UVExecutable"` で明示するか、`PATH` に追加してください。
 - `"VRCpilotDirectoryMissing"`: VRC Pilot プロジェクトのパスを確認してください。
 - `"NBAccessUnavailable"` / `"APIKeyMissing"`: `NBAccess.wl` の配置と API キー登録を見直してください。
+- `"InvalidPresentationFormat"`: `"Format"` は `Automatic`、`"Slides"`、`"Poster"` のいずれかを指定してください。
+- `"PosterTalkMissing"`: ポスター発表には原稿が必要です。SlideWorkflow でポスター原稿を作り「登録」してから再実行してください。
 - ワーカーが二重起動している疑いがある場合は、`VRCRealtimeStatus[]` の `AdoptedWorkerPID` を確認し、`VRCRealtimeKill[]` で停止してください。
 - SourceVault MCP サービスが停止していると発表原稿の取得が timeout するため、`VRCRealtimeStart::mcpstopped` の警告が出た場合はサービス起動を待つか `SourceVaultMCPStatus[]` を確認してください。
 - SourceVault MCP サービスが動作していても、保守 tick の実行中は command queue が一時的に応答しなくなることがあります（`VRCRealtimeStart::mcpbusy` の警告）。この間は発表登録簿を引けず発表を開始できないため、数分おいてから再度お試しください。

@@ -623,6 +623,75 @@ class _DisplayCandidate:
     bright_ratio: float
 
 
+#: A bright strip counts as a separator when it is at least this many times
+#: longer than it is thick (the URL bar measures 14-17, the tray 16-20).
+_SEPARATOR_MINIMUM_ELONGATION = 6.0
+#: How far past each end of a separator the cut runs, as a fraction of its
+#: length: far enough to pass the home button left of the URL bar.
+_SEPARATOR_EXTENSION = 0.35
+
+
+def _bar_separators(
+    rectangles: Sequence[tuple[Rect, Any]], frame_width: int
+) -> list[Any]:
+    """The contours of long thin bright strips (the URL bar, the tray)."""
+
+    minimum_length = max(140.0, 0.07 * frame_width)
+    separators: list[Any] = []
+    for _rect, contour in rectangles:
+        (_cx, _cy), (side_a, side_b), _angle = cv2.minAreaRect(contour)
+        long_side, short_side = max(side_a, side_b), min(side_a, side_b)
+        if long_side < minimum_length or short_side <= 0.0:
+            continue
+        if long_side / short_side < _SEPARATOR_MINIMUM_ELONGATION:
+            continue
+        separators.append(contour)
+    return separators
+
+
+def _sever_along_bars(
+    mask: NDArray[np.uint8], separators: Sequence[Any]
+) -> NDArray[np.uint8]:
+    """Cut a dark-surface *mask* along each bright strip's own line.
+
+    The console's idle page is a dark rectangle, and so is the owner standing
+    right behind the panel in dark clothes.  Seen from the bot, the legs come
+    down past the URL bar and touch the page's top edge, and the two read as
+    one dark blob a quarter full -- no longer a display, so the console drops
+    out of recognition while the bar and the tray sit in plain view (live,
+    2026-10-17: lost after one ten-count aim step, best confidence 0.00).  The
+    URL bar runs along the page's top edge, so a cut along the bar, carried a
+    little past both ends, separates the page from whatever stands behind it
+    without touching the page itself (there is a gap between bar and page).
+    """
+
+    if not separators:
+        return mask
+    cut = mask.copy()
+    for contour in separators:
+        box = cv2.boxPoints(cv2.minAreaRect(contour))
+        edges = [box[(i + 1) % 4] - box[i] for i in range(4)]
+        lengths = [float(np.hypot(edge[0], edge[1])) for edge in edges]
+        longest = int(np.argmax(lengths))
+        length = lengths[longest]
+        thickness = lengths[(longest + 1) % 4]
+        if length <= 0.0:
+            continue
+        direction = edges[longest] / length
+        center = box.mean(axis=0)
+        half = 0.5 * length * (1.0 + 2.0 * _SEPARATOR_EXTENSION)
+        start = center - direction * half
+        end = center + direction * half
+        cv2.line(
+            cut,
+            (int(round(float(start[0]))), int(round(float(start[1])))),
+            (int(round(float(end[0]))), int(round(float(end[1])))),
+            0,
+            max(3, int(round(thickness)) + 4),
+        )
+    return cut
+
+
 def _display_candidates(
     image: RGBImage,
     stats: _ChannelStats | None = None,
@@ -631,18 +700,20 @@ def _display_candidates(
     minimum_height: int = 18,
     minimum_area_fraction: float = 0.0006,
     maximum_area_fraction: float = 0.72,
+    separators: Sequence[Any] = (),
 ) -> list[_DisplayCandidate]:
     """Return idle-page display candidates ordered from largest to smallest.
 
     The operation panel is the wall screen in miniature, so the same geometry
     test finds both; callers separate them by size and by the surrounding
-    console furniture.
+    console furniture.  ``separators`` are bright strip contours to cut the
+    dark mask along before it is split into regions (see _sever_along_bars).
     """
 
     height, width = image.shape[:2]
     frame_area = float(width * height)
     stats = _channel_stats(image) if stats is None else stats
-    mask = _display_mask(image, stats)
+    mask = _sever_along_bars(_display_mask(image, stats), separators)
     value = stats.maximum
     # The white wordmark is the one feature every Sliden idle page carries.
     bright_mark = stats.minimum >= 150
@@ -1417,7 +1488,9 @@ def detect_sliden_console(
         if not (0.12 * height <= rect.center[1] <= 0.90 * height):
             continue
         previews.append((rect, _ordered_quad(contour)))
-    for candidate in _display_candidates(image, stats):
+    for candidate in _display_candidates(
+        image, stats, separators=_bar_separators(rectangles, width)
+    ):
         previews.append((candidate.rect, candidate.quad))
 
     slide_candidates: list[
@@ -1632,7 +1705,9 @@ def detect_sliden_panel_page(
     stats = _channel_stats(image)
     rectangles = _contour_rectangles(_bright_surfaces(stats))
     best: tuple[float, Rect, NDArray[np.float32]] | None = None
-    for candidate in _display_candidates(image, stats):
+    for candidate in _display_candidates(
+        image, stats, separators=_bar_separators(rectangles, image.shape[1])
+    ):
         thin, square, tray = _console_furniture(
             candidate.rect, rectangles, candidate.quad
         )

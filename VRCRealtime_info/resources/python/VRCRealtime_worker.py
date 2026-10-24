@@ -156,22 +156,77 @@ def _presentation_entry_from_deck(deck: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("presentation is withheld by the privacy gate")
     url = deck.get("url")
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        raise ValueError("registered presentation has no usable slide URL")
+        url = None
+    # A poster talk (SlideWorkflow's PosterURL: without SlideURL:) has no
+    # Sliden deck: the poster hangs in the world and the avatar reads the
+    # poster script.  Either URL makes the entry usable; neither does not.
+    poster_url = deck.get("posterUrl")
+    if not isinstance(poster_url, str) or not poster_url.startswith(("http://", "https://")):
+        poster_url = None
+    if url is None and poster_url is None:
+        raise ValueError("registered presentation has no usable slide or poster URL")
     seconds = deck.get("secondsPerSlide")
     start = deck.get("startSlide")
     end = deck.get("endSlide")
     instructions = deck.get("narrationInstructions")
+    withheld = bool(deck.get("talkWithheld"))
     return {
         "title": str(deck.get("title", "")) or None,
         "url": url,
+        "posterUrl": poster_url,
         "secondsPerSlide": float(seconds)
         if isinstance(seconds, (int, float)) and float(seconds) > 0.0
         else 25.0,
         "startSlide": int(start) if isinstance(start, int) and start >= 1 else 1,
         "endSlide": int(end) if isinstance(end, int) and end >= 1 else None,
         "narrationInstructions": instructions if isinstance(instructions, str) else "",
-        "talk": None if deck.get("talkWithheld") else _normalise_talk(deck.get("talk")),
+        "talk": None if withheld else _normalise_talk(deck.get("talk")),
+        "posterTalk": None if withheld else _normalise_talk(deck.get("posterTalk")),
     }
+
+
+def _presentation_format(entry: dict[str, Any], requested: Any) -> str:
+    """``"slides"`` or ``"poster"`` for *entry*.
+
+    A poster talk has no Sliden deck: the poster already hangs in the world
+    and the avatar reads the poster script in order.  The room's words decide
+    when the entry allows both (「ポスター発表を始めて」 → poster); asked for a
+    form the entry cannot give, the one it can is used -- a deck with only an
+    mp4 cannot be presented as a poster, and a poster-only entry cannot be
+    turned into slides.
+    """
+
+    wanted = str(requested or "auto").strip().lower()
+    has_slides = bool(entry.get("url"))
+    has_poster = bool(entry.get("posterUrl")) or entry.get("posterTalk") is not None
+    if wanted == "poster" and has_poster:
+        return "poster"
+    if wanted == "slides" and has_slides:
+        return "slides"
+    if has_slides:
+        return "slides"
+    if has_poster:
+        return "poster"
+    return "slides"
+
+
+def _requested_format_from_speech(requested: Any, heard: str) -> Any:
+    """The tool's ``format``, or 「ポスター」 in what the room said when the
+    model left it out.
+
+    One deck can carry both an mp4 and a poster (the CIHCD 2026 poster is also
+    計算と自然 35).  Such an entry defaults to slides, so a model that drops
+    ``format`` on 「CIHCD 2026のポスター発表を始めて」 would put the deck on
+    Sliden instead of reading the poster.  The transcript is only there on the
+    GPT-Live bridge; elsewhere *heard* is empty and the tool's value stands.
+    """
+
+    wanted = str(requested or "").strip().lower()
+    if wanted in ("slides", "poster"):
+        return wanted
+    if heard and "ポスター" in unicodedata.normalize("NFKC", heard):
+        return "poster"
+    return requested
 
 
 #: How questions are taken during a talk (set_question_mode / --question-mode).
@@ -2191,6 +2246,9 @@ class RealtimeBridge:
                 "title 付きの set_avatar_mode で始めた場合も start_presentation を"
                 "重ねて呼ばないでください)。登録簿の照合は tool 側が行うので、"
                 "タイトルを自分で言い換えたり番号を推測したりしないでください。"
+                "『〇〇のポスター発表を始めて』のようにポスター発表と言われたときは "
+                "start_presentation の format に poster を入れてください "
+                "(掲示済みのポスターを原稿で順に説明し、スライドは操作しません)。"
                 "ツールは登録簿からスライドURLと発表原稿を取得し、操作パネルへの投入と"
                 "発表開始までをバックグラウンドで実行します。"
                 "tool が not registered を返した場合は、その発表は登録されていないと"
@@ -2371,7 +2429,9 @@ class RealtimeBridge:
                             "指定タイトルの発表を開始する。SourceVaultの発表登録簿から"
                             "スライド(Sliden用mp4)のURLと発表原稿を取得し、プレゼンモードへ"
                             "切り替え、操作パネルへURLを投入して自動発表を始める。"
-                            "タイトルの表記ゆれは登録簿側で吸収するので、利用者が言った"
+                            "ポスター発表 (format=poster) ではスライドを操作せず、"
+                            "掲示済みのポスターの原稿を順に説明する。"
+                            "タイトルの表記ゆれや呼び名は登録簿側で吸収するので、利用者が言った"
                             "発表名をそのまま渡すこと。未登録なら開始せずエラーを返す。"
                         ),
                         "parameters": {
@@ -2384,7 +2444,16 @@ class RealtimeBridge:
                                         "(漢数字は算用数字にしてよい)。番号を推測・"
                                         "補完しないこと。"
                                     ),
-                                }
+                                },
+                                "format": {
+                                    "type": "string",
+                                    "enum": ["slides", "poster"],
+                                    "description": (
+                                        "『ポスター発表』と言われたら poster、"
+                                        "スライドの発表なら slides。言われていなければ省略"
+                                        "(登録簿にスライドがあればスライド、ポスターだけならポスター)。"
+                                    ),
+                                },
                             },
                             "required": ["title"],
                             "additionalProperties": False,
@@ -2876,6 +2945,8 @@ class RealtimeBridge:
                 f"『{title}』という発表は登録簿にありません。"
             ) from None
         entry.setdefault("talk", None)
+        entry.setdefault("posterUrl", None)
+        entry.setdefault("posterTalk", None)
         return entry, "builtin"
 
     _PRESENTATION_CONTROL_ACTIONS = {
@@ -4040,7 +4111,9 @@ class RealtimeBridge:
             if time.monotonic() >= ready_deadline:
                 raise SlidenError("Realtime connection was not ready for narration")
             time.sleep(0.1)
-        label = "導入" if kind == "opening" else "締め"
+        # A poster talk's paragraphs come through here too (kind "block<n>"):
+        # no slide to show, only script to read.
+        label = {"opening": "導入", "closing": "締め"}.get(kind, "本文")
         sent = self._send_now(
             {
                 "type": "conversation.item.create",
@@ -4228,6 +4301,10 @@ class RealtimeBridge:
         )
 
     def _run_presentation(self, command: dict[str, Any]) -> None:
+        if str(command.get("format") or "slides").strip().lower() == "poster":
+            # No Sliden deck: the poster hangs in the world already.
+            self._run_poster_presentation(command)
+            return
         url = str(command.get("url", "")).strip()
         presentation_title = str(command.get("presentationTitle", "")).strip() or None
         seconds_per_slide = float(command.get("secondsPerSlide", 30.0))
@@ -4288,6 +4365,7 @@ class RealtimeBridge:
                 muted=True,
                 presentationStatus="running",
                 presentationPhase="preparing",
+                presentationFormat="slides",
                 presentationTitle=presentation_title,
                 presentationURL=url,
                 presentationCurrentSlide=0,
@@ -4638,6 +4716,210 @@ class RealtimeBridge:
             except Exception as exc:
                 self._write_state(lastError=f"after presentation: {type(exc).__name__}: {exc}")
 
+    def _run_poster_presentation(self, command: dict[str, Any]) -> None:
+        """A poster talk: the poster already hangs in the world, so there is
+        no Sliden deck to load, no console to find and nothing to advance.
+        The avatar reads the poster script in order -- the opening, then one
+        paragraph per deck slide that carries poster text, then the closing --
+        with the same question windows between paragraphs and at the end as a
+        slide talk.  Everything about the console (navigation, URL entry,
+        page turns, show_slide) is absent rather than skipped, which is why
+        this is its own method and not a flag inside _run_presentation.
+        """
+
+        presentation_title = str(command.get("presentationTitle", "")).strip() or None
+        poster_url = str(command.get("posterUrl", "")).strip()
+        seconds_per_slide = float(command.get("secondsPerSlide", 30.0))
+        talk = _normalise_talk(command.get("talk"))
+        talk_source = str(command.get("talkSource", "poster"))
+        catalog_route = str(command.get("catalogRoute", "direct"))
+        question_seconds = float(command.get("questionSeconds", 5.0))
+        final_question_seconds = float(command.get("finalQuestionSeconds", 120.0))
+        if command.get("questionMode") not in (None, "", "automatic", "Automatic"):
+            self._set_question_mode(command.get("questionMode"), source="presentation")
+        run_id = uuid.uuid4().hex[:12]
+        was_muted = self.muted.is_set()
+        follower = self.owner_follower
+        follower_was_held = bool(
+            follower is not None and getattr(follower, "conversation_hold", False)
+        )
+        try:
+            if talk is None:
+                raise SlidenError("a poster talk needs a script, and none is registered")
+            if not 3.0 <= seconds_per_slide <= 300.0:
+                raise SlidenError("seconds per slide must be between 3 and 300")
+            if not 0.0 <= question_seconds <= 60.0:
+                raise SlidenError("question window must be between 0 and 60 seconds")
+            if not 0.0 <= final_question_seconds <= 1800.0:
+                raise SlidenError(
+                    "final question window must be between 0 and 1800 seconds"
+                )
+            # The paragraphs, in deck order.  Their numbers are deck slide
+            # numbers (gaps where a slide has no poster text), kept as they
+            # are so the state reads against the deck.
+            blocks = sorted(talk["slides"])
+            self._take_presentation_control()
+            self.muted.set()
+            self.console_slide = 0
+            self.presentation_controller = None
+            self.presentation_slides = []
+            self.presentation_talk = talk
+            self._write_state(
+                muted=True,
+                presentationStatus="running",
+                presentationPhase="preparing",
+                presentationFormat="poster",
+                presentationTitle=presentation_title,
+                presentationURL=poster_url,
+                presentationPosterURL=poster_url,
+                presentationTalkSource=talk_source,
+                presentationCurrentSlide=0,
+                presentationSlideCount=len(blocks),
+                presentationStartSlide=1,
+                presentationEndSlide=len(blocks),
+                presentationBlocks=list(blocks),
+                presentationCurrentBlock=None,
+                presentationConsoleSlide=0,
+                presentationNavigationEnabled=False,
+                presentationNavigationMode="never",
+                presentationNavigationStatus="disabled",
+                presentationLastTranscript="",
+                presentationLastError=None,
+                presentationCatalogRoute=catalog_route,
+                presentationTalkAvailable=True,
+                presentationTalkSlides=list(blocks),
+                presentationTalkOpening=bool(talk["opening"]),
+                presentationTalkClosing=bool(talk["closing"]),
+                presentationScriptedSlides=[],
+                presentationQAOpen=False,
+                presentationQuestionsAnswered=0,
+                presentationPaused=False,
+                presentationLastControl=None,
+                presentationStoppedBy=None,
+                presentationQuestionSeconds=question_seconds,
+                presentationFinalQuestionSeconds=final_question_seconds,
+                presentationStartedAt=time.time(),
+                presentationFinishedAt=None,
+            )
+            if follower is not None:
+                follower.set_conversation_active(True)
+            self._ensure_vrchat_microphone_live()
+            with self.state_lock:
+                microphone = self.state.get("vrchatMicMuted")
+            self._write_state(
+                presentationMicrophoneConfirmed=microphone is False,
+                presentationMicrophoneState=(
+                    "unknown" if microphone is None else
+                    "muted" if microphone else "live"
+                ),
+            )
+            ready, why = self._question_mode_ready(self.question_mode)
+            self._write_state(
+                presentationQuestionMode=self.question_mode,
+                presentationQuestionModeEffective=(
+                    self.question_mode if ready else "question_time"
+                ),
+                presentationQuestionModeReason=why or None,
+            )
+            if talk["opening"]:
+                self._presentation_state(presentationPhase="opening")
+                self._narrate_with_interruptions(
+                    run_id,
+                    "opening",
+                    self._segment_speaker(
+                        "opening", talk["opening"], run_id, seconds_per_slide
+                    ),
+                    script=talk["opening"],
+                )
+            scripted: list[int] = []
+            for index, number in enumerate(blocks, 1):
+                if self._presentation_cancelled():
+                    raise SlidenCancelled("presentation was cancelled")
+                entry = talk["slides"][number]
+                block_seconds = (
+                    entry["seconds"] if entry["seconds"] is not None else seconds_per_slide
+                )
+                self._presentation_state(
+                    presentationPhase="narrating",
+                    presentationCurrentSlide=index,
+                    presentationCurrentBlock=number,
+                )
+                self._narrate_with_interruptions(
+                    run_id,
+                    f"block{number}",
+                    self._segment_speaker(
+                        f"block{number}", entry["text"], run_id, block_seconds
+                    ),
+                    script=entry["text"],
+                )
+                scripted.append(number)
+                self._write_state(presentationScriptedSlides=list(scripted))
+                if index >= len(blocks):
+                    break
+                # Questions between paragraphs, as between slides: the
+                # paragraph just read is what the room wants to ask about.
+                if self._presentation_question_window(
+                    run_id, f"block{number}", question_seconds
+                ) == "stop":
+                    raise SlidenCancelled("presentation was stopped by voice")
+            if talk["closing"]:
+                self._presentation_state(presentationPhase="closing")
+                self._narrate_with_interruptions(
+                    run_id,
+                    "closing",
+                    self._segment_speaker(
+                        "closing", talk["closing"], run_id, seconds_per_slide
+                    ),
+                    script=talk["closing"],
+                )
+            if final_question_seconds > 0.0:
+                self._speak_presentation_line(
+                    f"presentation_final_qa:{run_id}",
+                    "この発表に関して質問があればどうぞ",
+                )
+                self._presentation_question_window(
+                    run_id, "final", final_question_seconds, final=True
+                )
+            self._presentation_state(
+                presentationStatus="completed",
+                presentationPhase="completed",
+                presentationFinishedAt=time.time(),
+            )
+        except SlidenCancelled:
+            self._presentation_state(
+                presentationStatus="stopped",
+                presentationPhase="stopped",
+                presentationFinishedAt=time.time(),
+            )
+        except Exception as exc:
+            self._write_state(
+                presentationStatus="error",
+                presentationPhase="error",
+                presentationLastError=f"{type(exc).__name__}: {exc}",
+                presentationFinishedAt=time.time(),
+            )
+            with self.state_lock:
+                where = str(self.state.get("presentationPhase") or "")
+            self._announce(
+                "presentation:error",
+                f"発表を中断しました ({self._PRESENTATION_CHAT.get(where, where) or type(exc).__name__})",
+                min_interval=0.0,
+            )
+        finally:
+            self.presentation_controller = None
+            self.presentation_slides = []
+            with self.slide_request_lock:
+                self.slide_request = None
+            if follower is not None and not follower_was_held:
+                follower.set_conversation_active(False)
+            if not was_muted:
+                self.muted.clear()
+                self._write_state(muted=False)
+            try:
+                self._presentation_finished()
+            except Exception as exc:
+                self._write_state(lastError=f"after presentation: {type(exc).__name__}: {exc}")
+
     def _presentation_finished(self) -> None:
         """Called once a talk has ended, however it ended.  (Realtime: its
         per-response instructions leave nothing behind to undo.)"""
@@ -4758,7 +5040,7 @@ class RealtimeBridge:
                     self.response_create_pending.set()
 
     def _presentation_start_instruction(
-        self, entry: dict[str, Any], catalog_route: str
+        self, entry: dict[str, Any], catalog_route: str, fmt: str = "slides"
     ) -> str:
         """What to say once a presentation has been started.
 
@@ -4769,6 +5051,14 @@ class RealtimeBridge:
         (2026-08-21).
         """
 
+        if fmt == "poster":
+            # Nothing to prepare: the poster is on the wall and the script is
+            # in hand, so the talk begins at once.
+            return (
+                f"{entry['title']}のポスター発表を開始しました (掲示済みのポスターを"
+                "原稿で説明します。スライドの操作はありません)。完了したとは言わず、"
+                "開始した事実だけを日本語で短く伝えてください。"
+            )
         opening = (
             f"{entry['title']}のプレゼンモードへ切り替え、"
             "スライドの準備を開始しました。完了したとは言わず、"
@@ -4824,34 +5114,57 @@ class RealtimeBridge:
         return corrected
 
     def _presentation_start_command(
-        self, title: Any
+        self, title: Any, requested_format: Any = None
     ) -> tuple[dict[str, Any], str, dict[str, Any]]:
         """Resolve a spoken title and build the presentation-start command.
 
         Shared by ``start_presentation`` and by ``set_avatar_mode`` when it is
         given a title, so whichever tool the model reaches for, the room gets
-        the same behaviour.
+        the same behaviour.  *requested_format* is the tool's ``format``
+        (「ポスター発表」 → "poster"); None lets the registry entry decide.
         """
 
         if isinstance(title, str):
             title = normalise_title_numbers(title)
-        title = self._reconcile_title_number(title, self._spoken_request_text())
+        heard = self._spoken_request_text()
+        title = self._reconcile_title_number(title, heard)
         entry, catalog_route = self._resolve_presentation(title)
+        fmt = _presentation_format(entry, _requested_format_from_speech(requested_format, heard))
+        talk = entry.get("talk")
+        talk_source = "slides"
+        if fmt == "poster":
+            # The poster script when there is one; otherwise the slide script
+            # read without slides, which still carries the talk's flow.
+            if entry.get("posterTalk") is not None:
+                talk = entry["posterTalk"]
+                talk_source = "poster"
+            elif talk is None:
+                self._write_state(
+                    presentationLastError=f"no script for poster talk: {entry['title']}"
+                )
+                raise ValueError(
+                    f"『{entry['title']}』のポスター発表の原稿が登録簿にありません。"
+                    "SlideWorkflow でポスター原稿を作って「登録」し直してください。"
+                )
         command = {
             "command": "presentation-start",
+            "format": fmt,
             "presentationTitle": entry["title"],
-            "url": entry["url"],
+            "url": entry.get("url") or "",
+            "posterUrl": entry.get("posterUrl") or "",
             "secondsPerSlide": entry["secondsPerSlide"],
             "startSlide": entry["startSlide"],
             "endSlide": entry["endSlide"],
             "narrationInstructions": entry["narrationInstructions"],
-            "talk": entry.get("talk"),
+            "talk": talk,
+            "talkSource": talk_source,
             "catalogRoute": catalog_route,
             # Asked by voice, nothing guarantees the avatar is standing at the
             # panel.  "auto" checks first and only walks when it has to, so
             # "start the talk" works from anywhere in the room without a
-            # pointless walk when it is already parked.
-            "navigateToConsole": "auto",
+            # pointless walk when it is already parked.  A poster talk has no
+            # panel to walk to.
+            "navigateToConsole": "never" if fmt == "poster" else "auto",
             # The recipe (frame the wall screen, find the bar, walk at it,
             # about-face, back off) plus one retry on the other side needs
             # more than the two minutes that cut a live run off mid-retry
@@ -4884,7 +5197,7 @@ class RealtimeBridge:
             navigation = str(self.state.get("presentationNavigationStatus") or "")
         same = bool(
             (running_title and running_title == str(entry.get("title", "")))
-            or (running_url and running_url == str(entry.get("url", "")))
+            or (running_url and running_url == str(entry.get("url") or ""))
         )
         if not same:
             return None
@@ -4919,21 +5232,23 @@ class RealtimeBridge:
         so both answer a repeat the same way.
         """
 
+        fmt = str(command.get("format") or "slides")
         if self._start_presentation(command):
             payload = {
                 "status": "started",
                 "mode": "Presentation",
                 "title": entry["title"],
-                "url": entry["url"],
-                "navigation": "auto",
-                "scripted": entry.get("talk") is not None,
+                "url": entry.get("url") or "",
+                "format": fmt,
+                "navigation": str(command.get("navigateToConsole") or "auto"),
+                "scripted": command.get("talk") is not None,
                 "catalog": catalog_route,
                 "catalogError": self.state.get("presentationCatalogError"),
             }
             payload.update(extra)
             self._send_function_output(call_id, payload)
             self._write_state(lastVoiceCommand=name, lastVoiceCommandValue=entry["title"])
-            return self._presentation_start_instruction(entry, catalog_route)
+            return self._presentation_start_instruction(entry, catalog_route, fmt)
         duplicate = self._presentation_duplicate_result(entry)
         if duplicate is None and self._presentation_running():
             # Another talk is running: asked for this one, the room wants to
@@ -4952,8 +5267,9 @@ class RealtimeBridge:
                     "mode": "Presentation",
                     "stopped": previous,
                     "title": entry["title"],
-                    "url": entry["url"],
-                    "scripted": entry.get("talk") is not None,
+                    "url": entry.get("url") or "",
+                    "format": fmt,
+                    "scripted": command.get("talk") is not None,
                     "catalog": catalog_route,
                 }
                 payload.update(extra)
@@ -5090,7 +5406,7 @@ class RealtimeBridge:
                     )
             elif name == "start_presentation":
                 entry, catalog_route, command = self._presentation_start_command(
-                    arguments.get("title", "")
+                    arguments.get("title", ""), arguments.get("format")
                 )
                 response_instruction = self._start_presentation_from_tool(
                     call_id, name, entry, catalog_route, command, {}
@@ -5125,6 +5441,11 @@ class RealtimeBridge:
                 if not self._presentation_running():
                     raise ValueError(
                         "スライドを操作できるのは発表の実行中だけです"
+                    )
+                if str(self.state.get("presentationFormat") or "") == "poster":
+                    raise ValueError(
+                        "ポスター発表にはスライドがありません。ポスターの該当箇所を"
+                        "言葉で示して、原稿の内容から答えてください"
                     )
                 target = self._resolve_slide_request(
                     arguments if isinstance(arguments, dict) else {}

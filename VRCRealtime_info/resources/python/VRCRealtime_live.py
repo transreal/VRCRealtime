@@ -78,7 +78,14 @@ LIVE_VOICED_PEAK = 0.01
 #: A script has been read when this share of it is in the output transcript.
 LIVE_NARRATION_COVERAGE = 0.8
 #: Purposes whose speech is a script (coverage decides when it is over).
-NARRATION_PURPOSES = ("presentation_slide:", "presentation_opening:", "presentation_closing:")
+NARRATION_PURPOSES = (
+    "presentation_slide:",
+    "presentation_opening:",
+    "presentation_closing:",
+    # A poster talk's paragraphs (presentation_block<n>:<run>): the poster
+    # hangs in the world, so there is no slide, only script.
+    "presentation_block",
+)
 
 #: Where the exchange with GPT-Live is recorded (no audio): what was sent,
 #: acknowledged, said and heard, for working out afterwards why a slide was

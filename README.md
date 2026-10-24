@@ -4,7 +4,7 @@
 
 **VRCRealtime** は、OpenAI の音声モデル (既定 GPT-Live、従来の Realtime API も可) と VRChat をつなぐ、ノンブロッキングな音声ブリッジパッケージです。
 
-VRChat 上のアバターに、OpenAI Realtime によるリアルタイム音声応答をまとわせ、来場者と自然に会話させる、あるいはオーナーに付き従わせる、スライドを自動で発表させる——といった常駐的なふるまいを、Wolfram Language のノートブックから軽く起動・監視できるようにすることが狙いです。
+VRChat 上のアバターに、OpenAI Realtime によるリアルタイム音声応答をまとわせ、来場者と自然に会話させる、あるいはオーナーに付き従わせる、スライドやポスターを自動で発表させる——といった常駐的なふるまいを、Wolfram Language のノートブックから軽く起動・監視できるようにすることが狙いです。
 
 この目的を実現するうえで最も重要な設計判断は、**重い処理をすべて外部の Python プロセスへ委譲する**ことです。VRChat 画面のキャプチャ、OSC によるアバター操作、音声認識・合成、OpenAI Realtime とのソケット通信は、`uv run` で起動される常駐ワーカー（`VRCRealtime_worker.py`）が担当します。Wolfram Language 側の関数はすべて、状態ファイル・制御ファイルを介したメッセージのやり取りに徹し、**即座に返るコマンド**として設計されています。`VRCRealtimeStart[]` 自体がノートブックカーネルをブロックしないため、起動直後から他の評価を続けられますし、`VRCRealtimeStatus[]` で任意のタイミングの状態を取得できます。
 
@@ -15,6 +15,8 @@ VRChat 上のアバターに、OpenAI Realtime によるリアルタイム音声
 オーナー追尾（`"AvatarMode" -> "OwnerFollow"`）は既定で幾何制御エンジン（`"Formation"`）を使い、ネームプレート OCR による発見 → 体のランドマークによる距離推定 → オーナーの左後方への回り込み → 視野内での停止、という一連の手続きを決定論的に行います。旧来の OSC ボタン操作方式（`"Legacy"`）も互換のため残されています。
 
 自動発表中の質疑応答は、環境音や足音・咳などのサーバ VAD 反応だけでは開始せず、**ローカル音声認識（Vosk）が実際に言葉として書き起こせたか**で判定するよう設計されています。これにより、雑音による誤発火で発表が中断される事故を避けています。スライドの区切りで質疑応答を開くふるまいは質問モードの種類（`"QuestionTime"` / `"Keywords"` / `"Detect"`）に関わらず常に有効になっており、聞いた直後に質問できないという抜けを防いでいます。
+
+発表の形はスライドだけではありません。登録簿の材料に応じて、掲示済みのポスターを段落ごとに説明する**ポスター発表**も行えます（`"Format"` オプション）。発表の呼び出しは、登録簿に付けた呼び名（`Aliases:` / `呼び名:`）を題名より優先して照合するため、長い題名の発表でも短い呼び名で始められます。
 
 ## 詳細説明
 
@@ -42,7 +44,7 @@ VRChat 上のアバターに、OpenAI Realtime によるリアルタイム音声
 5. 依存パッケージを `$packageDirectory` 直下に配置します。
    - **NBAccess.wl（必須）**: OpenAI の API キー取得・アクセス許可判定に使用します。無いと `VRCRealtimeStart[]` は失敗します。→ [NBAccess](https://github.com/transreal/NBAccess)
    - **SourceVault_voice.wl（任意）**: ローカル音声合成（Piper / AivisSpeech）ランタイムと声モデルを管轄します。→ [SourceVault_voice](https://github.com/transreal/SourceVault_voice)
-   - **SourceVault.wl（任意）**: 発表登録簿（スライド URL・発表原稿）と資料検索を MCP サービス越しに提供します。→ [SourceVault](https://github.com/transreal/SourceVault)
+   - **SourceVault.wl（任意）**: 発表登録簿（スライド URL・ポスター URL・発表原稿）と資料検索を MCP サービス越しに提供します。→ [SourceVault](https://github.com/transreal/SourceVault)
 
 外部実装（Python）は配布形では `VRCRealtime_info/resources/python/` にまとまっています。旧配置（`$packageDirectory` 直下に `VRCRealtime_worker.py` 等を直接置く形）もそのまま動作しますが、新しい配置が優先されます。
 
@@ -92,18 +94,18 @@ VRCRealtimeStatus[]
 VRCRealtimeStop["WaitSeconds" -> 8.0]
 ```
 
-主な既定値: `"Model" -> "gpt-live-1"`（GPT-Live。道具はバックエンドモデルへの Responses 委譲で実行。`"gpt-realtime-2.1"` で従来の Realtime）、`"FullDuplex" -> True`（GPT-Live使用時のみ有効。発表中以外は話しながら部屋の声も聞く全二重。`False` で Realtime と同じ半二重）、`"QuestionMode" -> "QuestionTime"`（発表中の質問の受け方。`"Keywords"` / `"Detect"` も選べ、音声「質問モードを切り替えたい」でも切り替わる。スライド区切りの質疑応答はどのモードでも開く）、`"Voice" -> "marin"`、`"AvatarMode" -> "Standalone"`、`"InputSource" -> "VRChat"`、`"AllowBargeIn" -> False`、`"EnableSourceVault" -> True`、`"EnableVoiceWebSearch" -> False`（既定オフの opt-in 機能）、`"RequirePaidAPIApproval" -> True`、`"ReplaceRunning" -> True`。
+主な既定値: `"Model" -> "gpt-live-1"`（GPT-Live。道具はバックエンドモデル `"LiveBackendModel"` への Responses 委譲で実行。`"gpt-realtime-2.1"` で従来の Realtime。`"API"` でも経路を明示可）、`"FullDuplex" -> True`（GPT-Live使用時のみ有効。発表中以外は話しながら部屋の声も聞く全二重。`False` で Realtime と同じ半二重）、`"QuestionMode" -> "QuestionTime"`（発表中の質問の受け方。`"Keywords"` / `"Detect"` も選べ、音声「質問モードを切り替えたい」でも切り替わる。スライド区切りの質疑応答はどのモードでも開く）、`"Voice" -> "marin"`、`"AvatarMode" -> "Standalone"`、`"InputSource" -> "VRChat"`、`"AllowBargeIn" -> False`、`"EnableSourceVault" -> True`、`"EnableVoiceWebSearch" -> False`（既定オフの opt-in 機能）、`"RequirePaidAPIApproval" -> True`、`"ReplaceRunning" -> True`。
 
 ### 主な機能
 
-- **セッション制御**: `VRCRealtimeStart[]` / `VRCRealtimeStatus[]` / `VRCRealtimeStop[]` / `VRCRealtimeKill[]` — 常駐ワーカーの起動・状態取得・正常終了・強制終了。
+- **セッション制御**: `VRCRealtimeStart[]` / `VRCRealtimeStatus[]` / `VRCRealtimeStop[]` / `VRCRealtimeKill[]` — 常駐ワーカーの起動・状態取得・正常終了・強制終了。`VRCRealtimeStatus[]` は実際に使われている経路（`"API"`）も返します。
 - **会話制御**: `VRCRealtimeSetInstructions[text]`、`VRCRealtimeMute[True|False]`、`VRCRealtimeEndConversation[]`、`VRCRealtimeSetQuestionMode[...]` — 応答方針の変更、マイク送信の一時停止、会話の終了と視覚ゲートの再有効化、発表中の質問の受け方（`"QuestionTime"` / `"Keywords"` / `"Detect"`）の実行中切り替え。
 - **視覚・音声**: `VRCRealtimeLook[question]` で VRChat 画面を Realtime モデルへ送って説明させ、`VRCRealtimeVoiceStatus[]` / `VRCRealtimeInstallVoiceCommandModel[]` でローカル音声資産（Piper / AivisSpeech、Vosk 音声コマンドモデル）を確認・導入します。
-- **プレゼンテーション**: `VRCRealtimeStartPresentation[target]`、`VRCRealtimeListPresentations[]`、`VRCRealtimePresentationStatus[]`、`VRCRealtimePresentationControl["Pause"|"Resume"|"Stop"|"ResumeHere"|"ResumeBack"]`、`VRCRealtimeStopPresentation[]` — Sliden の MP4 を用いた自動発表の開始・一覧・状態・制御。質疑応答中にスライドを動かした場合は「表示中のスライドから続ける（`"ResumeHere"`）」か「発表が進んでいた位置へ戻る（`"ResumeBack"`）」かを選べます。質問受付はローカル音声認識による書き起こしの成否で判定するため、環境音や足音だけでは反応しません。
+- **プレゼンテーション**: `VRCRealtimeStartPresentation[target]`、`VRCRealtimeListPresentations[]`、`VRCRealtimePresentationStatus[]`、`VRCRealtimePresentationControl["Pause"|"Resume"|"Stop"|"ResumeHere"|"ResumeBack"]`、`VRCRealtimeStopPresentation[]` — Sliden の MP4 を用いたスライド発表、および掲示済みポスターを段落ごとに説明するポスター発表（`"Format" -> Automatic | "Slides" | "Poster"`）の開始・一覧・状態・制御。登録簿の呼び名（`Aliases:` / `呼び名:`）を題名より優先して照合します。質疑応答中にスライドを動かした場合は「表示中のスライドから続ける（`"ResumeHere"`）」か「発表が進んでいた位置へ戻る（`"ResumeBack"`）」かを選べます。質問受付はローカル音声認識による書き起こしの成否で判定するため、環境音や足音だけでは反応しません。
 - **オーナー追尾**: `VRCRealtimeSetOwnerAccount[name]`、`VRCRealtimeSetFollowDistance[m]`、`VRCRealtimeSetFormation[...]`、`VRCRealtimeSetMode[...]`、`VRCRealtimeLocateOwner[]` — 追尾対象・距離・隊形・モードの実行中変更とメニュー探索の即時実行。
 - **モニタリング**: `VRCRealtimeMonitor[]` — 1秒ごとに更新される軽量な `Dynamic` 状態表示。
 - **ワールド入場**: `VRCRealtimeJoinNGCGalleryWorld[world]`、`VRCRealtimeJoinNGCGalleryWorldStatus[]`、`VRCRealtimeJoinNGCGalleryWorldStop[]` — VRC Pilot を使ったワールド入場の自動化と進捗監視。
-- **グローバル変数**: `$VRCRealtimeVersion`、`$VRCRealtimeOwnerAccount`（既定 `"nconc"`）、`$VRCRealtimeDefaultSlideURL`。
+- **グローバル変数**: `$VRCRealtimeVersion`（現行 `"0.11.0"`）、`$VRCRealtimeOwnerAccount`（既定 `"nconc"`）、`$VRCRealtimeDefaultSlideURL`。
 
 ### ドキュメント一覧
 
@@ -129,7 +131,7 @@ VRCRealtimePresentationStatus[]
 VRCRealtimeStop["WaitSeconds" -> 8.0]
 ```
 
-会話中は「会話に参加して」「会話から離脱して」といった音声コマンドでも参加・離脱を制御できます。詳しい操作パターンは [example.md](example.md) を参照してください。
+会話中は「会話に参加して」「会話から離脱して」といった音声コマンドでも参加・離脱を制御できます。登録済みの発表は、タイトルや呼び名を指定して `VRCRealtimeStartPresentation["計算と自然と31"]` のように始められ、ポスター発表は `"Format" -> "Poster"` で明示できます。詳しい操作パターンは [example.md](example.md) を参照してください。
 
 ---
 
