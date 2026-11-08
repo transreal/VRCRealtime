@@ -1096,6 +1096,85 @@ def console_page_rects(image: RGBImage) -> list[Rect]:
     return rects
 
 
+def _well_shape_ok(rect: Rect, width: int, height: int) -> bool:
+    """Whether *rect* has the size, shape and place of a URL dialog's well."""
+
+    frame_area = float(width * height)
+    aspect = rect.width / rect.height
+    area = rect.width * rect.height
+    # The older dialog's well was about 6.6:1; the current one is a thin
+    # strip of 12.8:1 (770 x 60 at 1942 x 1136), which the old ceiling of
+    # 12 rejected -- the click opened the dialog, and the run, seeing no
+    # dialog, aimed at a URL bar the dialog now hid and gave up.
+    if not (4.0 <= aspect <= 18.0):
+        return False
+    if not (0.008 * frame_area <= area <= 0.10 * frame_area):
+        return False
+    return 0.2 * height <= rect.center[1] <= 0.85 * height
+
+
+def _outlined_wells(
+    cyan: NDArray[np.uint8],
+    stats: _ChannelStats,
+) -> list[tuple[Rect, Rect]]:
+    """Input wells framed by a cyan rule, as ``(well, rule)`` pairs.
+
+    The "Enter URL" dialog is translucent: its well is not a colour of its
+    own but the dialog's dark tint over whatever stands behind it.  On live
+    frames the well's brightest channel was 29 in front of the dim carpet
+    (2026-10-03) and 33-36 in front of a lit room (2026-11-07), with the
+    dialog body around it at 44-52.  No darkness ceiling separates the two
+    with any margin -- the fixed one of 30 lost the dialog as soon as the room
+    behind it got brighter, and the run died with "timed out while
+    recognizing the Sliden URL input dialog" while the dialog sat open in
+    the middle of every frame it saved.  The cyan rule round the focused
+    well is drawn on top and does not change with the room, so it finds the
+    well whatever the background.  ``rule`` is the rule's box (the send arrow
+    is searched for to the right of it); ``well`` is the inside, clear of the
+    rule so that the rule is not taken for the field's clear button.
+    """
+
+    height, width = cyan.shape[:2]
+    result: list[tuple[Rect, Rect]] = []
+    for rule, _contour in _contour_rectangles(cyan):
+        if not _well_shape_ok(rule, width, height):
+            continue
+        area = rule.width * rule.height
+        box = cyan[rule.y : rule.bottom, rule.x : rule.right]
+        # A frame, not a filled cyan bar.
+        if np.count_nonzero(box) > 0.25 * area:
+            continue
+        # It has to run round all four sides (the corners are rounded, hence
+        # the lower bar for the short sides).
+        band = max(2, int(round(0.12 * rule.height)))
+        across = (
+            np.count_nonzero(box[:band].any(axis=0)) / rule.width,
+            np.count_nonzero(box[-band:].any(axis=0)) / rule.width,
+        )
+        down = (
+            np.count_nonzero(box[:, :band].any(axis=1)) / rule.height,
+            np.count_nonzero(box[:, -band:].any(axis=1)) / rule.height,
+        )
+        if min(across) < 0.8 or min(down) < 0.5:
+            continue
+        inset = max(3, int(round(0.12 * rule.height)))
+        if rule.width <= 2 * inset or rule.height <= 2 * inset:
+            continue
+        well = Rect(
+            rule.x + inset,
+            rule.y + inset,
+            rule.width - 2 * inset,
+            rule.height - 2 * inset,
+        )
+        # The well is dark even over a bright room (the tint lets through
+        # about a sixth of the background); a cyan-framed light field is
+        # something else.
+        if float(np.median(stats.maximum[well.y : well.bottom, well.x : well.right])) > 96:
+            continue
+        result.append((well, rule))
+    return result
+
+
 def _detect_modal(
     image: RGBImage,
     stats: _ChannelStats | None = None,
@@ -1108,7 +1187,9 @@ def _detect_modal(
     # merging into one contour.  It is also close to the limit both ways: the
     # "Enter URL" dialog of 2026-10-03 has a well of max channel 28 (the older
     # "URL を入力" one, 18), and from 33 up the Home world's dark furniture
-    # starts to pass for a dialog (4-5 of 765 world-join frames).
+    # starts to pass for a dialog (4-5 of 765 world-join frames).  That
+    # dialog is translucent, though, and in front of a lit room its well
+    # reads 33-36; it is found by its cyan rule instead (_outlined_wells).
     dark = cv2.bitwise_and(
         _at_most(stats.maximum, 30),
         _at_most(cv2.subtract(stats.maximum, stats.minimum), 25),
@@ -1119,32 +1200,29 @@ def _detect_modal(
         cv2.getStructuringElement(cv2.MORPH_RECT, (7, 5)),
     )
     cyan = _cyan_mask(image, stats)
-    candidates: list[tuple[float, Rect]] = []
-    for rect, _contour in _contour_rectangles(dark):
-        aspect = rect.width / rect.height
-        area = rect.width * rect.height
-        # The older dialog's well was about 6.6:1; the current one is a thin
-        # strip of 12.8:1 (770 x 60 at 1942 x 1136), which the old ceiling of
-        # 12 rejected -- the click opened the dialog, and the run, seeing no
-        # dialog, aimed at a URL bar the dialog now hid and gave up.
-        if not (4.0 <= aspect <= 18.0):
-            continue
-        if not (0.008 * frame_area <= area <= 0.10 * frame_area):
-            continue
-        if rect.center[1] < 0.2 * height or rect.center[1] > 0.85 * height:
-            continue
-        right = min(width, rect.right + max(40, int(0.18 * rect.width)))
-        top = max(0, rect.y - int(0.2 * rect.height))
-        bottom = min(height, rect.bottom + int(0.2 * rect.height))
-        submit_roi = cyan[top:bottom, rect.right:right]
+    # (well, box): the box bounds the well on screen, its rule included, and
+    # the send arrow is looked for beyond its right edge.
+    wells: list[tuple[Rect, Rect]] = [
+        (rect, rect)
+        for rect, _contour in _contour_rectangles(dark)
+        if _well_shape_ok(rect, width, height)
+    ]
+    wells.extend(_outlined_wells(cyan, stats))
+    candidates: list[tuple[float, Rect, Rect]] = []
+    for well, box in wells:
+        area = box.width * box.height
+        right = min(width, box.right + max(40, int(0.18 * box.width)))
+        top = max(0, box.y - int(0.2 * box.height))
+        bottom = min(height, box.bottom + int(0.2 * box.height))
+        submit_roi = cyan[top:bottom, box.right:right]
         cyan_pixels = int(np.count_nonzero(submit_roi))
         if cyan_pixels < max(20, int(0.002 * area)):
             continue
         score = area / frame_area + min(0.1, cyan_pixels / max(1.0, area))
-        candidates.append((score, rect))
+        candidates.append((score, well, box))
     if not candidates:
         return None, None, None, 0.0
-    score, input_rect = max(candidates, key=lambda item: item[0])
+    score, input_rect, input_box = max(candidates, key=lambda item: item[0])
 
     # A non-empty Sliden input well shows a cyan circular X button in its
     # rightmost portion. It is absent for an empty field, so keep it optional.
@@ -1169,10 +1247,11 @@ def _detect_modal(
             input_rect.y + float(clear_centroids[largest_clear, 1]),
         )
 
-    search_left = input_rect.right
-    search_right = min(width, input_rect.right + max(50, int(0.22 * input_rect.width)))
-    search_top = max(0, input_rect.y - int(0.25 * input_rect.height))
-    search_bottom = min(height, input_rect.bottom + int(0.25 * input_rect.height))
+    # Beyond the box, so a cyan rule round the well is not part of the search.
+    search_left = input_box.right
+    search_right = min(width, input_box.right + max(50, int(0.22 * input_box.width)))
+    search_top = max(0, input_box.y - int(0.25 * input_box.height))
+    search_bottom = min(height, input_box.bottom + int(0.25 * input_box.height))
     roi = cyan[search_top:search_bottom, search_left:search_right]
     components, labels, stats, centroids = cv2.connectedComponentsWithStats(roi)
     submit: Point | None = None
@@ -1185,8 +1264,8 @@ def _detect_modal(
             )
     if submit is None:
         submit = (
-            input_rect.right + 0.09 * input_rect.width,
-            input_rect.center[1],
+            input_box.right + 0.09 * input_box.width,
+            input_box.center[1],
         )
     return input_rect.center, clear, submit, min(1.0, 0.6 + score)
 
