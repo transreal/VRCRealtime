@@ -84,7 +84,7 @@ Block[{$CharacterEncoding = "UTF-8"},
   Needs["VRCRealtime`", "VRCRealtime.wl"]];
 
 VRCRealtimeStart[
-  "Voice" -> "marin",
+  "Voice" -> "harema",
   "OutputDevice" -> "CABLE-A Input",
   "Instructions" -> "日本語で自然かつ簡潔に会話してください。"
 ]
@@ -94,7 +94,7 @@ VRCRealtimeStatus[]
 VRCRealtimeStop["WaitSeconds" -> 8.0]
 ```
 
-主な既定値: `"Model" -> "gpt-live-1"`（GPT-Live。道具はバックエンドモデル `"LiveBackendModel"` への Responses 委譲で実行。`"gpt-realtime-2.1"` で従来の Realtime。`"API"` でも経路を明示可）、`"FullDuplex" -> True`（GPT-Live使用時のみ有効。発表中以外は話しながら部屋の声も聞く全二重。`False` で Realtime と同じ半二重）、`"QuestionMode" -> "QuestionTime"`（発表中の質問の受け方。`"Keywords"` / `"Detect"` も選べ、音声「質問モードを切り替えたい」でも切り替わる。スライド区切りの質疑応答はどのモードでも開く）、`"Voice" -> "marin"`、`"AvatarMode" -> "Standalone"`、`"InputSource" -> "VRChat"`、`"AllowBargeIn" -> False`、`"EnableSourceVault" -> True`、`"EnableVoiceWebSearch" -> False`（既定オフの opt-in 機能）、`"RequirePaidAPIApproval" -> True`、`"ReplaceRunning" -> True`。
+主な既定値: `"Model" -> "gpt-live-1"`（GPT-Live。道具はバックエンドモデル `"LiveBackendModel"` への Responses 委譲で実行。`"gpt-realtime-2.1"` で従来の Realtime。`"API"` でも経路を明示可）、`"FullDuplex" -> True`（GPT-Live使用時のみ有効。発表中以外は話しながら部屋の声も聞く全二重。`False` で Realtime と同じ半二重）、`"QuestionMode" -> "QuestionTime"`（発表中の質問の受け方。`"Keywords"` / `"Detect"` も選べ、音声「質問モードを切り替えたい」でも切り替わる。スライド区切りの質疑応答はどのモードでも開く）、`"Voice" -> Automatic`（GPT-Live では日本語の声 `"harema"`、Realtime では `"marin"`）、`"AvatarMode" -> "Standalone"`、`"InputSource" -> "VRChat"`、`"AllowBargeIn" -> False`、`"EnableSourceVault" -> True`、`"EnableVoiceWebSearch" -> False`（既定オフの opt-in 機能）、`"RequirePaidAPIApproval" -> True`、`"ReplaceRunning" -> True`。
 
 ### 主な機能
 

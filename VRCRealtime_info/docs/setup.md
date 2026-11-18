@@ -72,7 +72,7 @@ AppendTo[$Path, $packageDirectory];
 VRCRealtimeStart[
   "AvatarMode" -> "Standalone",
   "Model" -> "gpt-live-1",   (* 既定。従来の Realtime なら "gpt-realtime-2.1" *)
-  "Voice" -> "marin"
+  "Voice" -> "harema"         (* 既定 Automatic = GPT-Live では "harema"、Realtime では "marin" *)
 ]
 ```
 

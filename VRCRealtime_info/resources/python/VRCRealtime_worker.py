@@ -6762,7 +6762,9 @@ def _parse_args() -> argparse.Namespace:
     )
     # GPT-Live exchange log (JSONL, no audio).  Empty = %TEMP%/vrc-live-events.jsonl.
     parser.add_argument("--live-event-log", default="")
-    parser.add_argument("--voice", default="marin")
+    # Empty = follow the API: harema on GPT-Live, marin on Realtime
+    # (see default_voice).
+    parser.add_argument("--voice", default="")
     parser.add_argument(
         "--instructions",
         default=os.environ.get(
@@ -7004,6 +7006,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error(
             "--avatar-mode owner-follow/presentation requires --visual-attention-gate"
         )
+    if not str(args.voice or "").strip():
+        args.voice = default_voice(args.model, args.api)
     return args
 
 
@@ -7014,6 +7018,16 @@ def resolve_api(model: str, requested: str = "auto") -> str:
     if requested in ("live", "realtime"):
         return requested
     return "live" if str(model).strip().casefold().startswith("gpt-live") else "realtime"
+
+
+def default_voice(model: str, requested_api: str = "auto") -> str:
+    """Voice used when none is given: harema on GPT-Live, marin on Realtime.
+
+    harema (Japanese) exists only on GPT-Live; the Realtime API has no such
+    voice, so the Realtime default stays marin.
+    """
+
+    return "harema" if resolve_api(model, requested_api) == "live" else "marin"
 
 
 def _navigation_mode(value: Any) -> str | None:

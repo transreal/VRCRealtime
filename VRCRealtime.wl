@@ -25,6 +25,8 @@ VRCRealtimeStart::usage =
 " <>
   "既定のモデルは GPT-Live (\"Model\" -> \"gpt-live-1\")。道具 (SourceVault 検索・発表操作・アバター操作・画面を見る等) は Responses 委譲でバックエンドモデル (\"LiveBackendModel\"、既定 gpt-5.6-luna) が実行し、GPT-Live が結果を話す。\"Model\" -> \"gpt-realtime-2.1\" で従来の Realtime 経路。\"API\" -> \"Realtime\"|\"Live\" で明示もできる (既定 Automatic = モデル名で判定)。
 " <>
+  "声は \"Voice\" で選ぶ。既定 Automatic = GPT-Live では日本語の声 \"harema\"、Realtime では \"marin\" (harema は GPT-Live 専用の声)。
+" <>
   "\"QuestionMode\" は発表中の質問の受け方: \"QuestionTime\" (既定。スライドの区切りでだけ質問を受ける) / \"Keywords\" (特定ワード。区切りに加えて、発表中でも「質問」「スライド」「プレゼン」「発表」(\"InterruptWords\") を含む発話で中断して質問を受け、終われば中断した文から再開。「発表を中断して」で一時停止もできる。ローカル Vosk 認識が必要) / \"Detect\" (二段構え。区切りに加えて、発表中に声が続いたら一旦止め、モデルが自分への質問か判断して応じ、違えば続ける)。どのモードでもスライドの区切りでは「質問があればどうぞ」と表示して \"QuestionSeconds\" 待つ。実行中は VRCRealtimeSetQuestionMode か、音声で「質問モードを切り替えたい」と言えば会話で選べる。
 " <>
   "オーナー追尾 (\"AvatarMode\" -> \"OwnerFollow\") は既定で幾何制御エンジン (\"OwnerFollowEngine\" -> \"Formation\") を使う: ネームプレート OCR で発見 → 体のランドマークで距離 (\"OwnerFollowDistanceMeters\"、既定 1.8 m) まで接近 → 向きを推定してオーナーの左後方 (\"OwnerFollowRearAngleDegrees\"、既定 35) へ回り込み → オーナーを視野右端 (\"OwnerFollowOwnerBearingDegrees\"、既定 33 度) に置いて停止。ヨーは相対マウス入力 (3600 counts/360 度) で決定論的に回す。\"Legacy\" で旧 OSC ボタン制御に戻せる。";
@@ -574,6 +576,17 @@ iSendCommand[command_Association] := Module[{json, temporary, wrote = False},
   ]
 ];
 
+(* 経路 (API) はモデル名で決まる: gpt-live-* は GPT-Live、ほかは Realtime。
+   "API" で明示 ("realtime" / "live") されていればそれに従う (worker の resolve_api と同じ規則)。 *)
+iResolvedAPI[model_String, api_String] := If[api === "auto",
+  If[StringStartsQ[ToLowerCase[StringTrim[model]], "gpt-live"], "Live", "Realtime"],
+  Capitalize[api]];
+
+(* "Voice" -> Automatic のときの声。GPT-Live は日本語の声 harema、Realtime は marin
+   (harema は GPT-Live 専用の声で、Realtime API には無い)。 *)
+iDefaultVoice[model_String, api_String] :=
+  If[iResolvedAPI[model, api] === "Live", "harema", "marin"];
+
 Options[VRCRealtimeStart] = {
   (* 既定は GPT-Live。道具は Responses 委譲のバックエンドが実行する。
      "gpt-realtime-2.1" で従来の Realtime 経路に戻せる。 *)
@@ -586,7 +599,8 @@ Options[VRCRealtimeStart] = {
   (* GPT-Live のみ: 発表中以外は話しながらも部屋の声を聞く (全二重)。
      False で Realtime と同じ半二重 (話している間と直後 1.2 秒は聞かない) *)
   "FullDuplex" -> True,
-  "Voice" -> "marin",
+  (* 音声モデルの声。Automatic = GPT-Live では "harema"、Realtime では "marin"。 *)
+  "Voice" -> Automatic,
   "Instructions" -> "日本語で自然かつ簡潔に会話してください。",
   "VRCpilotDirectory" -> "C:\\Users\\imai_\\gitwork\\vrcpilot",
   "UVExecutable" -> Automatic,
@@ -678,7 +692,7 @@ Options[VRCRealtimeStart] = {
      True: 必須にする (無ければ起動しない)。False: 使わない。 *)
   "PrivateTTS" -> Automatic,
   (* ローカル読み上げに使う声。Automatic は SourceVault_voice が選ぶ既定の声。
-     特定の声は前提にしない。上の "Voice" (OpenAI Realtime の声、既定 marin) とは
+     特定の声は前提にしない。上の "Voice" (OpenAI の音声モデルの声、既定 harema / marin) とは
      別物なので名前を分ける — 同名にすると OptionValue が先に書いた方を返し、
      Realtime の声名でローカルの声を探して必ず失敗する。 *)
   "SpeechVoice" -> Automatic,
@@ -815,7 +829,10 @@ VRCRealtimeStart[OptionsPattern[]] := Module[
       "\"QuestionMode\" must be \"QuestionTime\", \"Keywords\" or \"Detect\"."]]];
   If[!VectorQ[interruptWords, StringQ],
     Return[iFailure["InvalidInterruptWords", "\"InterruptWords\" must be a list of strings."]]];
-  voice = OptionValue["Voice"];
+  voice = Replace[OptionValue["Voice"], Automatic :> iDefaultVoice[model, api]];
+  If[!StringQ[voice] || StringTrim[voice] === "",
+    Return[iFailure["InvalidVoice",
+      "\"Voice\" must be Automatic or a voice name such as \"harema\"."]]];
   instructions = OptionValue["Instructions"];
   inputSource = OptionValue["InputSource"];
   inputDevice = Replace[OptionValue["InputDevice"], Automatic -> ""];
@@ -1277,9 +1294,7 @@ VRCRealtimeStart[OptionsPattern[]] := Module[
     "StateFile" -> stateFile,
     "ControlFile" -> controlFile,
     "Model" -> model,
-    "API" -> If[api === "auto",
-      If[StringStartsQ[ToLowerCase[model], "gpt-live"], "Live", "Realtime"],
-      Capitalize[api]],
+    "API" -> iResolvedAPI[model, api],
     "LiveBackendModel" -> Replace[liveBackendModel, "" -> Automatic],
     "QuestionMode" -> iQuestionModeName[questionMode],
     "Voice" -> voice,
