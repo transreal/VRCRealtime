@@ -23,7 +23,7 @@ $VRCRealtimeDefaultSlideURL::usage =
 VRCRealtimeStart::usage =
   "VRCRealtimeStart[] は OpenAI の音声モデルと VRChat の音声ブリッジを外部プロセスで起動し、直ちに制御情報を返す。
 " <>
-  "既定のモデルは GPT-Live (\"Model\" -> \"gpt-live-1\")。道具 (SourceVault 検索・発表操作・アバター操作・画面を見る等) は Responses 委譲でバックエンドモデル (\"LiveBackendModel\"、既定 gpt-5.6-luna) が実行し、GPT-Live が結果を話す。\"Model\" -> \"gpt-realtime-2.1\" で従来の Realtime 経路。\"API\" -> \"Realtime\"|\"Live\" で明示もできる (既定 Automatic = モデル名で判定)。
+  "既定のモデルは GPT-Live (\"Model\" -> \"gpt-live-1.1\"。\"gpt-live-1\" も使えるが声の高さが不安定)。道具 (SourceVault 検索・発表操作・アバター操作・画面を見る等) は Responses 委譲でバックエンドモデル (\"LiveBackendModel\"、既定 gpt-5.6-luna) が実行し、GPT-Live が結果を話す。\"Model\" -> \"gpt-realtime-2.1\" で従来の Realtime 経路。\"API\" -> \"Realtime\"|\"Live\" で明示もできる (既定 Automatic = モデル名で判定)。
 " <>
   "声は \"Voice\" で選ぶ。既定 Automatic = GPT-Live では日本語の声 \"harema\"、Realtime では \"marin\" (harema は GPT-Live 専用の声)。
 " <>
@@ -590,7 +590,8 @@ iDefaultVoice[model_String, api_String] :=
 Options[VRCRealtimeStart] = {
   (* 既定は GPT-Live。道具は Responses 委譲のバックエンドが実行する。
      "gpt-realtime-2.1" で従来の Realtime 経路に戻せる。 *)
-  "Model" -> "gpt-live-1",
+  (* 2026-11-21: 既定を gpt-live-1.1 に。gpt-live-1 では harema の声の高さが不安定だった *)
+  "Model" -> "gpt-live-1.1",
   "API" -> Automatic,
   "LiveBackendModel" -> Automatic,
   (* 発表中の質問の受け方。"QuestionTime" | "Keywords" | "Detect" *)
@@ -819,7 +820,7 @@ VRCRealtimeStart[OptionsPattern[]] := Module[
   questionMode = iQuestionModeWire[OptionValue["QuestionMode"]];
   interruptWords = Replace[OptionValue["InterruptWords"], Automatic | None -> {}];
   If[!StringQ[model] || StringTrim[model] === "",
-    Return[iFailure["InvalidModel", "\"Model\" must be a model name such as \"gpt-live-1\"."]]];
+    Return[iFailure["InvalidModel", "\"Model\" must be a model name such as \"gpt-live-1.1\"."]]];
   If[!MemberQ[{"auto", "realtime", "live"}, api],
     Return[iFailure["InvalidAPI", "\"API\" must be Automatic, \"Realtime\" or \"Live\"."]]];
   If[!StringQ[liveBackendModel],
@@ -1538,16 +1539,24 @@ iNormalizeTalkPayload[talk_] := Module[{slides},
   If[!ListQ[slides], Return[Null]];
   slides = Select[
     Function[s, If[!AssociationQ[s], Nothing,
-      <|"slide" -> With[{n = Lookup[s, "slide", Lookup[s, "Slide", 0]]},
+      Join[<|"slide" -> With[{n = Lookup[s, "slide", Lookup[s, "Slide", 0]]},
           If[IntegerQ[n], n, 0]],
         "seconds" -> With[{v = Lookup[s, "seconds", Lookup[s, "Seconds", Null]]},
           If[NumericQ[v], N[v], Null]],
-        "text" -> ToString @ Lookup[s, "text", Lookup[s, "Text", ""]]|>]] /@ slides,
+        "text" -> ToString @ Lookup[s, "text", Lookup[s, "Text", ""]]|>,
+        (* SlideWorkflow v1.72: 字幕の言語の文 *)
+        With[{sub = Lookup[s, "subtitle", Lookup[s, "Subtitle", None]]},
+          If[StringQ[sub] && StringTrim[sub] =!= "", <|"subtitle" -> sub|>, <||>]]]]] /@ slides,
     #["slide"] >= 1 && StringTrim[#["text"]] =!= "" &];
   If[slides === {}, Return[Null]];
   <|"opening" -> ToString @ Lookup[talk, "opening", Lookup[talk, "Opening", ""]],
     "closing" -> ToString @ Lookup[talk, "closing", Lookup[talk, "Closing", ""]],
-    "slides" -> slides|>];
+    "slides" -> slides,
+    (* SlideWorkflow v1.72: 音声の言語・字幕の言語 (空 = 従来どおり日本語・字幕なし) *)
+    "language" -> ToString @ Lookup[talk, "language", Lookup[talk, "SpeechLanguage", ""]],
+    "subtitleLanguage" -> ToString @ Lookup[talk, "subtitleLanguage", Lookup[talk, "SubtitleLanguage", ""]],
+    "openingSubtitle" -> ToString @ Lookup[talk, "openingSubtitle", Lookup[talk, "OpeningSubtitle", ""]],
+    "closingSubtitle" -> ToString @ Lookup[talk, "closingSubtitle", Lookup[talk, "ClosingSubtitle", ""]]|>];
 
 (* NavigateToConsole は既定 Automatic:
      まず今いる場所から操作パネルが使えるか確かめ、使えるならそのまま開始し、
@@ -1582,7 +1591,12 @@ Options[VRCRealtimeStartPresentation] = {
      "QuestionMode" / VRCRealtimeSetQuestionMode / 音声での切り替え) のまま。
      スライド区切りの質疑 (QuestionSeconds) はどのモードでも開く。Keywords / Detect
      はそれに加えて、スライドの途中でも割り込めるようにするもの。 *)
-  "QuestionMode" -> Automatic
+  "QuestionMode" -> Automatic,
+  (* SlideWorkflow v1.72: 多言語 Sliden ワールド (NCG Gallery) では登録簿の段重ねの mp4 (multiLangUrl) を
+     スクリーンに読ませ、参加者がワールドの 日本語 / English のボタンで段を選ぶ。
+     Automatic = 今いるワールドが多言語ワールドのときだけ (VRChat のログで判定)、
+     True = どこでも段重ねの mp4、False = いつも 16:9 の mp4 *)
+  "MultiLang" -> Automatic
 };
 
 (* 引数は Sliden 用 mp4 の URL、または登録済みの発表タイトル
@@ -1714,6 +1728,13 @@ VRCRealtimeStartPresentation[
     "command" -> "presentation-start",
     "format" -> ToLowerCase[format],
     "url" -> url,
+    (* SlideWorkflow v1.72: 多言語 Sliden ワールド用の段重ねの mp4 と段の言語 *)
+    "multiLangUrl" -> If[AssociationQ[spec], StringTrim @ ToString @ Lookup[spec, "multiLangUrl", ""], ""],
+    "multiLangTracks" -> If[AssociationQ[spec],
+      Select[Flatten[{Lookup[spec, "multiLangTracks", {}]}], StringQ], {}],
+    "multiLangMode" -> Replace[OptionValue["MultiLang"], {True -> "always", False -> "never", _ -> "auto"}],
+    (* v1.72 より古い登録簿 (SourceVault のサービス) はこの項目自体を返さない。ボットの状態に理由を残す *)
+    "multiLangField" -> If[AssociationQ[spec], KeyExistsQ[spec, "multiLangUrl"], True],
     "posterUrl" -> purl,
     "talkSource" -> talkSource,
     "secondsPerSlide" -> N[seconds],

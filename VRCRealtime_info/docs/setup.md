@@ -71,12 +71,12 @@ AppendTo[$Path, $packageDirectory];
 ```wolfram
 VRCRealtimeStart[
   "AvatarMode" -> "Standalone",
-  "Model" -> "gpt-live-1",   (* 既定。従来の Realtime なら "gpt-realtime-2.1" *)
+  "Model" -> "gpt-live-1.1",   (* 既定。従来の Realtime なら "gpt-realtime-2.1" *)
   "Voice" -> "harema"         (* 既定 Automatic = GPT-Live では "harema"、Realtime では "marin" *)
 ]
 ```
 
-既定のモデルは GPT-Live（`"Model" -> "gpt-live-1"`）です。SourceVault 検索・発表操作・アバター操作・画面を見るなどの道具は Responses 委譲のバックエンドモデル（`"LiveBackendModel"`、既定 Automatic = gpt-5.6-luna）が実行し、GPT-Live がその結果を話します。従来の Realtime 経路に戻すには `"Model" -> "gpt-realtime-2.1"` を指定するか、`"API" -> "Realtime"`（または `"Live"`）で明示できます（既定 `"API" -> Automatic` はモデル名から自動判定）。GPT-Live は既定で全二重（`"FullDuplex" -> True`：発表中以外は話しながら部屋の声も聞く）で動作し、`False` にすると Realtime と同じ半二重（話している間と直後 1.2 秒は聞かない）になります。
+既定のモデルは GPT-Live（`"Model" -> "gpt-live-1.1"`、2026-11-21 から）です。`"gpt-live-1"` も使えますが、harema の声の高さが不安定になります（男声並みに下がる・急に高くなる）。SourceVault 検索・発表操作・アバター操作・画面を見るなどの道具は Responses 委譲のバックエンドモデル（`"LiveBackendModel"`、既定 Automatic = gpt-5.6-luna）が実行し、GPT-Live がその結果を話します。従来の Realtime 経路に戻すには `"Model" -> "gpt-realtime-2.1"` を指定するか、`"API" -> "Realtime"`（または `"Live"`）で明示できます（既定 `"API" -> Automatic` はモデル名から自動判定）。GPT-Live は既定で全二重（`"FullDuplex" -> True`：発表中以外は話しながら部屋の声も聞く）で動作し、`False` にすると Realtime と同じ半二重（話している間と直後 1.2 秒は聞かない）になります。
 
 起動後、以下で状態を確認します。
 

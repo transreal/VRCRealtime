@@ -225,18 +225,30 @@ def _read_frame(capture: cv2.VideoCapture, index: int) -> RGBImage:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
-def _sliden_frame_indices(frame_count: int, fps: float) -> list[int] | None:
-    """Return slide starts for NotebookExtensions' 29+30n layout."""
+#: Frames of the repeated last slide at the end of a Sliden mp4.  30 is
+#: NotebookExtensions' layout and SlideWorkflow's up to v1.71 (length =
+#: slides + 0.97 s); SlideWorkflow v1.72 writes 8 (slides + 0.23 s) so that a
+#: Sliden counting pages by rounding the length (NCG Gallery) gets no extra
+#: page, while one counting by truncating it still gets every slide.
+_SLIDEN_TAIL_FRAMES = (30, 8)
 
-    if abs(fps - 30.0) > 0.05 or frame_count < 59:
+
+def _sliden_frame_indices(frame_count: int, fps: float) -> list[int] | None:
+    """Return slide starts for the 29+30n+tail layout (tail 30 or 8)."""
+
+    if abs(fps - 30.0) > 0.05:
         return None
-    remainder = frame_count - 29
-    if remainder <= 0 or remainder % 30 != 0:
-        return None
-    slide_count = remainder // 30
-    # The final 30-frame segment repeats the last slide.  Frame 29 begins
-    # slide two, so only slide_count-1 starts are appended after frame zero.
-    return [0] + [29 + 30 * i for i in range(max(0, slide_count - 1))]
+    for tail in _SLIDEN_TAIL_FRAMES:
+        # 29 frames of slide one, 30 for each later slide, then *tail*
+        # frames repeating the last one.
+        remainder = frame_count - 29 - tail
+        if remainder < 0 or remainder % 30 != 0:
+            continue
+        slide_count = remainder // 30 + 1
+        # Frame 29 begins slide two, so only slide_count-1 starts are
+        # appended after frame zero.
+        return [0] + [29 + 30 * i for i in range(max(0, slide_count - 1))]
+    return None
 
 
 def _scene_frame_indices(

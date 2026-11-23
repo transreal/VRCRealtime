@@ -119,22 +119,258 @@ def _normalise_talk(value: Any) -> dict[str, Any] | None:
         if number < 1 or not isinstance(text, str) or not text.strip():
             continue
         seconds = item.get("seconds")
+        subtitle = item.get("subtitle")
         slides[number] = {
             "slide": number,
             "text": text.strip(),
             "seconds": float(seconds)
             if isinstance(seconds, (int, float)) and float(seconds) > 0.0
             else None,
+            # SlideWorkflow v1.72: the same slide in the subtitle language
+            # (Subtitle: in the deck), sent to the chatbox while narrating.
+            "subtitle": subtitle.strip()
+            if isinstance(subtitle, str) and subtitle.strip()
+            else None,
         }
     if not slides:
         return None
     opening = value.get("opening")
     closing = value.get("closing")
+    opening_subtitle = value.get("openingSubtitle")
+    closing_subtitle = value.get("closingSubtitle")
     return {
         "opening": opening.strip() if isinstance(opening, str) else "",
         "closing": closing.strip() if isinstance(closing, str) else "",
         "slides": slides,
+        # SlideWorkflow v1.72: the language the script is written in and is
+        # spoken in ("" = registered before v1.72: Japanese, as always), and
+        # the subtitle language ("" = no subtitles).
+        "language": _language_code(value.get("language")),
+        "subtitleLanguage": _language_code(value.get("subtitleLanguage")),
+        "openingSubtitle": opening_subtitle.strip()
+        if isinstance(opening_subtitle, str)
+        else "",
+        "closingSubtitle": closing_subtitle.strip()
+        if isinstance(closing_subtitle, str)
+        else "",
     }
+
+
+#: Names used inside the (Japanese) instructions to the voice model.
+_LANGUAGE_LABELS = {
+    "ja": "日本語",
+    "en": "英語",
+    "jv": "ジャワ語",
+    "id": "インドネシア語",
+    "zh": "中国語",
+    "ko": "韓国語",
+    "fr": "フランス語",
+    "de": "ドイツ語",
+    "es": "スペイン語",
+}
+
+_LANGUAGE_ALIASES = {
+    "japanese": "ja",
+    "jp": "ja",
+    "日本語": "ja",
+    "english": "en",
+    "英語": "en",
+    "javanese": "jv",
+    "jawa": "jv",
+    "basa jawa": "jv",
+    "ジャワ語": "jv",
+    "indonesian": "id",
+    "chinese": "zh",
+    "korean": "ko",
+    "french": "fr",
+    "german": "de",
+    "spanish": "es",
+}
+
+
+def _language_code(value: Any) -> str:
+    """A two-letter code from what the registry carries ("ja", "Japanese",
+    "en-US" ...).  "" when absent or unrecognisable, which callers read as
+    "the old behaviour" (Japanese narration, no subtitles)."""
+
+    if not isinstance(value, str):
+        return ""
+    text = value.strip().lower()
+    if not text:
+        return ""
+    if text in _LANGUAGE_ALIASES:
+        return _LANGUAGE_ALIASES[text]
+    head = text.replace("_", "-").split("-", 1)[0]
+    if len(head) == 2 and head.isalpha() and head.isascii():
+        return head
+    return ""
+
+
+def _language_label(code: str) -> str:
+    """Japanese name of *code* for the instructions; "" means Japanese."""
+
+    if not code:
+        return "日本語"
+    return _LANGUAGE_LABELS.get(code, code)
+
+
+#: VRChat's chatbox takes at most 144 characters per message.
+_CHATBOX_LIMIT = 144
+
+
+def _subtitle_chunks(text: str, limit: int = _CHATBOX_LIMIT) -> list[str]:
+    """Split *text* into chatbox-sized pieces at sentence ends.
+
+    Sentences are kept whole when they fit; consecutive short ones are packed
+    together; a sentence longer than *limit* is cut at a space when there is
+    one near the end, otherwise hard at the limit."""
+
+    import re
+
+    flat = re.sub(r"\s*\n\s*", " ", text or "").strip()
+    if not flat:
+        return []
+    sentences = [
+        s.strip()
+        for s in re.split(r"(?<=[。．！？!?])\s*|(?<=[.])\s+", flat)
+        if s and s.strip()
+    ]
+    pieces: list[str] = []
+    for sentence in sentences:
+        while len(sentence) > limit:
+            cut = sentence.rfind(" ", int(limit * 0.6), limit)
+            if cut <= 0:
+                cut = limit
+            pieces.append(sentence[:cut].strip())
+            sentence = sentence[cut:].strip()
+        if sentence:
+            pieces.append(sentence)
+    chunks: list[str] = []
+    for piece in pieces:
+        if chunks:
+            joiner = "" if chunks[-1][-1:] in "。．！？" else " "
+            if len(chunks[-1]) + len(joiner) + len(piece) <= limit:
+                chunks[-1] = chunks[-1] + joiner + piece
+                continue
+        chunks.append(piece)
+    return chunks
+
+
+def _speech_seconds(text: str, language: str) -> float:
+    """Rough speaking time of *text*: about 7 characters a second for
+    Japanese/Chinese, 14 for scripts written in words."""
+
+    rate = 7.0 if language in ("", "ja", "zh") else 14.0
+    return max(3.0, len(text or "") / rate)
+
+
+# Worlds whose Sliden screens show one track of a stacked multi-language mp4
+# (SlideWorkflow's MultiLangURL:, 1920 x 1080K, tracks from the top), chosen
+# by each viewer on the world's 日本語 / English panel.  Elsewhere such an mp4
+# would show every track squeezed onto one screen, so the 16:9 deck is used.
+# NCG Gallery took the multi-language screens on 2026-11-22 (RapterLake's
+# report SlideWorkflow_info/design/multilang_sliden_world_report.md); the
+# second id is the test copy "Gallery MultiLang".
+_MULTILANG_WORLD_IDS = (
+    "wrld_394525f6-914f-41d5-a5e5-132603865671",
+    "wrld_46857bb5-40fc-46ac-a610-5c369643e154",
+)
+_VRCHAT_JOINING = re.compile(rb"\[Behaviour\] Joining (wrld_[0-9A-Za-z-]+)")
+_VRCHAT_ENTERING = re.compile(rb"\[Behaviour\] Entering Room: ([^\r\n]*)")
+
+
+def _vrchat_log_directory() -> Path | None:
+    profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    directory = Path(profile) / "AppData" / "LocalLow" / "VRChat" / "VRChat"
+    return directory if directory.is_dir() else None
+
+
+def _current_vrchat_world(
+    log_directory: Path | None = None,
+    *,
+    block_bytes: int = 1 << 20,
+    max_bytes: int = 512 << 20,
+) -> dict[str, str] | None:
+    """The world the local VRChat client joined last, from its newest
+    output_log (``{"id": "wrld_…", "name": "NCG Gallery", "log": path}``).
+
+    The join line can be hours of logging back, so the newest log is read
+    backwards a block at a time until a ``Joining wrld_`` line turns up.
+    ``None`` when there is no log or no join in it.
+    """
+
+    directory = log_directory if log_directory is not None else _vrchat_log_directory()
+    if directory is None:
+        return None
+    try:
+        logs = sorted(
+            directory.glob("output_log_*.txt"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    if not logs:
+        return None
+    log = logs[0]
+    try:
+        with log.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            position = end
+            tail = b""
+            while position > 0 and end - position < max_bytes:
+                step = min(block_bytes, position)
+                position -= step
+                handle.seek(position)
+                tail = handle.read(step) + tail
+                joins = list(_VRCHAT_JOINING.finditer(tail))
+                if not joins:
+                    continue
+                last = joins[-1]
+                # A line cut at the block edge is read again with the next
+                # block; only trust a join whose line starts inside *tail*.
+                if position > 0 and b"\n" not in tail[: last.start()]:
+                    continue
+                world_id = last.group(1).decode("ascii", "replace")
+                name = ""
+                entering = [
+                    m for m in _VRCHAT_ENTERING.finditer(tail) if m.start() <= last.start()
+                ]
+                if entering:
+                    name = entering[-1].group(1).decode("utf-8", "replace").strip()
+                return {"id": world_id, "name": name, "log": str(log)}
+    except OSError:
+        return None
+    return None
+
+
+def _multilang_console_url(
+    url: str,
+    multi_url: str,
+    mode: str,
+    world: dict[str, str] | None,
+    world_ids: tuple[str, ...] | list[str],
+) -> tuple[str, str]:
+    """``(URL to load into Sliden, why)``.
+
+    *mode*: ``"auto"`` loads the stacked mp4 only in a multi-language world,
+    ``"always"`` loads it anywhere (testing), ``"never"`` keeps the 16:9 deck.
+    The bot's own slide images always come from the 16:9 *url*.
+    """
+
+    if not multi_url.startswith(("http://", "https://")):
+        return url, "no_multilang_url"
+    wanted = (mode or "auto").strip().lower()
+    if wanted == "never":
+        return url, "disabled"
+    if wanted == "always":
+        return multi_url, "forced"
+    if world is None:
+        return url, "world_unknown"
+    if world.get("id") in tuple(world_ids):
+        return multi_url, "multilang_world"
+    return url, "other_world"
 
 
 def _presentation_entry_from_deck(deck: dict[str, Any]) -> dict[str, Any]:
@@ -170,9 +406,22 @@ def _presentation_entry_from_deck(deck: dict[str, Any]) -> dict[str, Any]:
     end = deck.get("endSlide")
     instructions = deck.get("narrationInstructions")
     withheld = bool(deck.get("talkWithheld"))
+    # SlideWorkflow v1.72: the stacked multi-language mp4 for worlds that
+    # let each viewer pick a track (_MULTILANG_WORLD_IDS).
+    multi_url = deck.get("multiLangUrl")
+    if not isinstance(multi_url, str) or not multi_url.startswith(("http://", "https://")):
+        multi_url = None
+    tracks = deck.get("multiLangTracks")
+    tracks = [str(t) for t in tracks if isinstance(t, str) and t] if isinstance(tracks, list) else []
     return {
         "title": str(deck.get("title", "")) or None,
         "url": url,
+        "multiLangUrl": multi_url,
+        "multiLangTracks": tracks,
+        # A registry service older than v1.72 leaves the field out altogether
+        # (an up-to-date one sends "" for a deck without the stacked mp4);
+        # the run says so instead of quietly showing the 16:9 deck.
+        "multiLangField": "multiLangUrl" in deck,
         "posterUrl": poster_url,
         "secondsPerSlide": float(seconds)
         if isinstance(seconds, (int, float)) and float(seconds) > 0.0
@@ -675,6 +924,11 @@ class RealtimeBridge:
         self.console_slide = 0
         self.presentation_controller: Any = None
         self.presentation_talk: dict[str, Any] | None = None
+        #: SlideWorkflow v1.72: the language the current talk is spoken in
+        #: ("" = Japanese, the behaviour before languages were registered)
+        #: and the subtitle language sent to the chatbox ("" = none).
+        self.presentation_language = ""
+        self.presentation_subtitle_language = ""
         #: How questions are taken during a talk (QUESTION_MODES).  Changed by
         #: voice (set_question_mode), by the notebook ("question-mode") or by a
         #: presentation-start command that names one.
@@ -1316,6 +1570,69 @@ class RealtimeBridge:
             return False
         self._write_state(chatboxLast=line, chatboxLastAt=time.time())
         return True
+
+    # ---- SlideWorkflow v1.72: speech language and chatbox subtitles ----
+
+    #: Seconds between subtitle lines at the least; VRChat drops chatbox
+    #: messages that come too fast.
+    _SUBTITLE_MIN_INTERVAL = 2.5
+    #: Wait before the first line, so the phase line ("発表中 3/12") is
+    #: readable for a moment instead of being replaced at once.
+    _SUBTITLE_LEAD_SECONDS = 1.5
+
+    def _speech_label(self) -> str:
+        """The talk's language as named in the voice instructions."""
+
+        return _language_label(getattr(self, "presentation_language", ""))
+
+    def _speech_is_japanese(self) -> bool:
+        return getattr(self, "presentation_language", "") in ("", "ja")
+
+    def _start_subtitles(
+        self, key: str, text: str | None, seconds_hint: float
+    ) -> threading.Event | None:
+        """Send *text* to the chatbox line by line while a part is narrated.
+
+        The pace spreads the lines over *seconds_hint* in proportion to their
+        length, never faster than _SUBTITLE_MIN_INTERVAL, and holds while the
+        question window is open (the narration holds too).  Set the returned
+        event when the narration of the part ends; whatever is left unsent
+        then is dropped rather than flushed, because the next part's lines
+        are about to start."""
+
+        if not text or not text.strip():
+            return None
+        chunks = _subtitle_chunks(text)
+        if not chunks:
+            return None
+        stop = threading.Event()
+        total = float(sum(len(c) for c in chunks)) or 1.0
+        budget = max(float(seconds_hint), self._SUBTITLE_MIN_INTERVAL * len(chunks))
+
+        def run() -> None:
+            if stop.wait(self._SUBTITLE_LEAD_SECONDS):
+                return
+            for index, chunk in enumerate(chunks):
+                while self.presentation_qa_open.is_set() and not stop.is_set():
+                    if self._presentation_cancelled():
+                        return
+                    time.sleep(0.3)
+                if stop.is_set() or self._presentation_cancelled():
+                    return
+                self._announce(f"subtitle:{key}:{index}", chunk, min_interval=0.0)
+                self._write_state(
+                    presentationSubtitleKey=key,
+                    presentationSubtitleIndex=index,
+                    presentationSubtitleCount=len(chunks),
+                )
+                if index == len(chunks) - 1:
+                    return
+                dwell = max(self._SUBTITLE_MIN_INTERVAL, budget * len(chunk) / total)
+                if stop.wait(dwell):
+                    return
+
+        threading.Thread(target=run, name=f"subtitles-{key}", daemon=True).start()
+        return stop
 
     def _presentation_state(self, **updates: Any) -> None:
         """Write presentation state and narrate the change to the room."""
@@ -3687,8 +4004,14 @@ class RealtimeBridge:
         self._request_response(
             purpose=purpose,
             instructions=(
-                f"日本語で「{text}」とだけ発話してください。"
-                "他のことは何も言わず、質問もしないでください。"
+                (
+                    f"日本語で「{text}」とだけ発話してください。"
+                    if self._speech_is_japanese()
+                    # SlideWorkflow v1.72: a talk in another language says
+                    # its fixed lines in that language too.
+                    else f"「{text}」を{self._speech_label()}に訳した一言だけを発話してください。"
+                )
+                + "他のことは何も言わず、質問もしないでください。"
             ),
         )
         try:
@@ -3754,7 +4077,15 @@ class RealtimeBridge:
                             "text": (
                                 self._interrupt_rule(interrupt)
                                 + "ここから短い質疑応答です。次の規則を守ってください。\n"
-                                "1. 質問には簡潔に、日本語で答える。長広舌にしない。\n"
+                                + (
+                                    "1. 質問には簡潔に、日本語で答える。長広舌にしない。\n"
+                                    if self._speech_is_japanese()
+                                    # SlideWorkflow v1.72: the room of a talk
+                                    # in another language asks in several.
+                                    else "1. 質問には簡潔に、質問と同じ言語で答える"
+                                    f"(発表は{self._speech_label()})。長広舌にしない。\n"
+                                )
+                                +
                                 "2. 発表資料や保存資料に関する事実を問われたら、"
                                 "推測で答えず必ず sourcevault_lookup を先に呼ぶ"
                                 "(高速な事前索引が最初に引かれる)。"
@@ -4143,7 +4474,7 @@ class RealtimeBridge:
             purpose=purpose,
             instructions=(
                 self._resume_lead(resume_phrase)
-                + f"上の{label}の原稿の内容だけを、自然な発表口調の日本語で話してください。"
+                + f"上の{label}の原稿の内容だけを、自然な発表口調の{self._speech_label()}で話してください。"
                 "原稿に無い事実を足さず、読み上げ調にせず、記号やURLは読まないでください。"
                 "話し終えたら、次へ進む合図や質問をせずに停止してください。"
             ),
@@ -4203,7 +4534,7 @@ class RealtimeBridge:
                 )
                 instructions = (
                     self._resume_lead(resume_phrase)
-                    + "上の原稿の残りだけを、自然な発表口調の日本語で話してください。"
+                    + f"上の原稿の残りだけを、自然な発表口調の{self._speech_label()}で話してください。"
                     "原稿に書かれていない事実・数値・引用を足さないでください。"
                     "箇条書き記号・記号列・URLは読み上げないでください。"
                     "話し終えたら次へ進む合図や質問をせず停止してください。"
@@ -4216,7 +4547,7 @@ class RealtimeBridge:
                 )
                 instructions = (
                     self._resume_lead(resume_phrase)
-                    + "このスライドの説明の残りだけを、日本語で短く話してください。"
+                    + f"このスライドの説明の残りだけを、{self._speech_label()}で短く話してください。"
                     "画像にない事実を作らず、話し終えたら次へ進む合図や質問をせず"
                     "停止してください。"
                 )
@@ -4279,7 +4610,7 @@ class RealtimeBridge:
             raise SlidenError("the extracted slide could not be sent to Realtime")
         if script:
             instructions = (
-                f"上の発表原稿の内容だけを、自然な発表口調の日本語で"
+                f"上の発表原稿の内容だけを、自然な発表口調の{self._speech_label()}で"
                 f"{seconds_per_slide:g}秒前後を目安に話してください。"
                 "原稿に書かれていない事実・数値・引用を足さないでください。"
                 "一字一句の読み上げにはせず、話し言葉として自然に整えてください。"
@@ -4288,7 +4619,7 @@ class RealtimeBridge:
             )
         else:
             instructions = (
-                f"添付スライドを日本語で{seconds_per_slide:g}秒前後を目安に発表してください。"
+                f"添付スライドを{self._speech_label()}で{seconds_per_slide:g}秒前後を目安に発表してください。"
                 "画像に実際に書かれている内容を正確に読み、単なる全文読み上げではなく、"
                 "聴衆に分かる自然な説明にしてください。画像にない事実を作らないでください。"
                 "この1枚の説明だけを行い、説明を終えたら次へ進む合図や質問をせず停止してください。"
@@ -4300,12 +4631,40 @@ class RealtimeBridge:
             purpose, max(90.0, seconds_per_slide * 5.0), interruptible=True
         )
 
+    def _multilang_world_ids(self) -> tuple[str, ...]:
+        """World ids that show one track of a stacked mp4
+        (``--multilang-worlds``, comma separated; empty = none)."""
+
+        raw = getattr(self.args, "multilang_worlds", None)
+        if raw is None:
+            return _MULTILANG_WORLD_IDS
+        return tuple(w.strip() for w in str(raw).split(",") if w.strip())
+
     def _run_presentation(self, command: dict[str, Any]) -> None:
         if str(command.get("format") or "slides").strip().lower() == "poster":
             # No Sliden deck: the poster hangs in the world already.
             self._run_poster_presentation(command)
             return
         url = str(command.get("url", "")).strip()
+        # SlideWorkflow v1.72: in a multi-language Sliden world the screen
+        # gets the stacked mp4 and each viewer picks a track on the world's
+        # panel; the bot's own slide images still come from the 16:9 *url*.
+        multi_url = str(command.get("multiLangUrl") or "").strip()
+        multi_tracks = [
+            str(t) for t in (command.get("multiLangTracks") or []) if isinstance(t, str) and t
+        ]
+        world = _current_vrchat_world() if multi_url else None
+        console_url, console_url_reason = _multilang_console_url(
+            url,
+            multi_url,
+            str(command.get("multiLangMode") or "auto"),
+            world,
+            self._multilang_world_ids(),
+        )
+        if not multi_url and command.get("multiLangField") is False:
+            # 2026-11-22: the registry file had the URL but the running
+            # SourceVault service predated v1.72 and dropped it.
+            console_url_reason = "registry_service_without_multilang_field"
         presentation_title = str(command.get("presentationTitle", "")).strip() or None
         seconds_per_slide = float(command.get("secondsPerSlide", 30.0))
         console_timeout = float(command.get("consoleTimeoutSeconds", 30.0))
@@ -4318,6 +4677,10 @@ class RealtimeBridge:
         maximum_megabytes = float(command.get("maxDownloadMegabytes", 256.0))
         narration_instructions = str(command.get("narrationInstructions", ""))
         talk = _normalise_talk(command.get("talk"))
+        # SlideWorkflow v1.72: speak in the registered language and put the
+        # subtitle-language text in the chatbox.  Unregistered = Japanese.
+        self.presentation_language = (talk or {}).get("language", "") or ""
+        self.presentation_subtitle_language = (talk or {}).get("subtitleLanguage", "") or ""
         catalog_route = str(command.get("catalogRoute", "direct"))
         question_seconds = float(command.get("questionSeconds", 5.0))
         final_question_seconds = float(command.get("finalQuestionSeconds", 120.0))
@@ -4368,6 +4731,12 @@ class RealtimeBridge:
                 presentationFormat="slides",
                 presentationTitle=presentation_title,
                 presentationURL=url,
+                presentationConsoleURL=console_url,
+                presentationConsoleURLReason=console_url_reason,
+                presentationMultiLang=console_url != url,
+                presentationMultiLangTracks=multi_tracks if console_url != url else [],
+                presentationWorldId=(world or {}).get("id"),
+                presentationWorldName=(world or {}).get("name"),
                 presentationCurrentSlide=0,
                 presentationSlideCount=0,
                 presentationStartSlide=start_slide,
@@ -4422,6 +4791,11 @@ class RealtimeBridge:
                 presentationTalkSlides=sorted(talk["slides"]) if talk else [],
                 presentationTalkOpening=bool(talk and talk["opening"]),
                 presentationTalkClosing=bool(talk and talk["closing"]),
+                presentationLanguage=self.presentation_language or "ja",
+                presentationSubtitleLanguage=self.presentation_subtitle_language or None,
+                presentationSubtitledSlides=sorted(
+                    n for n, s in (talk["slides"].items() if talk else []) if s.get("subtitle")
+                ),
                 presentationScriptedSlides=[],
                 presentationAdvanceDifferences=[],
                 presentationUnconfirmedAdvances=0,
@@ -4526,7 +4900,15 @@ class RealtimeBridge:
                     controller.locate_and_approach(
                         timeout_seconds=navigation_timeout,
                     )
-            controller.configure_url(url)
+            controller.configure_url(console_url)
+            if console_url != url:
+                # The panel is easy to miss; say once where the switch is.
+                self._announce(
+                    "multilang",
+                    "スライドはスクリーン下のボタンで 日本語 / English を選べます。"
+                    "Use the buttons below the screen to switch the slides to English.",
+                    min_interval=0.0,
+                )
             self.console_slide = 1
             self._write_state(presentationConsoleSlide=1)
             for skipped in range(1, start_slide):
@@ -4550,14 +4932,23 @@ class RealtimeBridge:
             )
             if talk and talk["opening"]:
                 self._presentation_state(presentationPhase="opening")
-                self._narrate_with_interruptions(
-                    run_id,
-                    "opening",
-                    self._segment_speaker(
-                        "opening", talk["opening"], run_id, seconds_per_slide
-                    ),
-                    script=talk["opening"],
+                subtitles = self._start_subtitles(
+                    f"{run_id}:opening",
+                    talk.get("openingSubtitle"),
+                    _speech_seconds(talk["opening"], self.presentation_language),
                 )
+                try:
+                    self._narrate_with_interruptions(
+                        run_id,
+                        "opening",
+                        self._segment_speaker(
+                            "opening", talk["opening"], run_id, seconds_per_slide
+                        ),
+                        script=talk["opening"],
+                    )
+                finally:
+                    if subtitles is not None:
+                        subtitles.set()
             scripted: list[int] = []
             advance_differences: list[float] = []
             unconfirmed = 0
@@ -4579,20 +4970,31 @@ class RealtimeBridge:
                     presentationPhase="narrating",
                     presentationCurrentSlide=slide_number,
                 )
-                moved = self._narrate_with_interruptions(
-                    run_id,
-                    f"slide{slide_number}",
-                    self._slide_speaker(
-                        slides[slide_number - 1],
-                        slide_number,
-                        slide_count,
-                        slide_seconds,
-                        narration_instructions,
-                        run_id,
-                    ),
-                    script=script,
-                    slide_number=slide_number,
+                subtitles = self._start_subtitles(
+                    f"{run_id}:slide{slide_number}",
+                    entry.get("subtitle") if entry else None,
+                    _speech_seconds(script, self.presentation_language)
+                    if script
+                    else slide_seconds,
                 )
+                try:
+                    moved = self._narrate_with_interruptions(
+                        run_id,
+                        f"slide{slide_number}",
+                        self._slide_speaker(
+                            slides[slide_number - 1],
+                            slide_number,
+                            slide_count,
+                            slide_seconds,
+                            narration_instructions,
+                            run_id,
+                        ),
+                        script=script,
+                        slide_number=slide_number,
+                    )
+                finally:
+                    if subtitles is not None:
+                        subtitles.set()
                 if script and slide_number not in scripted:
                     scripted.append(slide_number)
                     self._write_state(presentationScriptedSlides=list(scripted))
@@ -4650,14 +5052,23 @@ class RealtimeBridge:
                 slide_number += 1
             if talk and talk["closing"]:
                 self._presentation_state(presentationPhase="closing")
-                self._narrate_with_interruptions(
-                    run_id,
-                    "closing",
-                    self._segment_speaker(
-                        "closing", talk["closing"], run_id, seconds_per_slide
-                    ),
-                    script=talk["closing"],
+                subtitles = self._start_subtitles(
+                    f"{run_id}:closing",
+                    talk.get("closingSubtitle"),
+                    _speech_seconds(talk["closing"], self.presentation_language),
                 )
+                try:
+                    self._narrate_with_interruptions(
+                        run_id,
+                        "closing",
+                        self._segment_speaker(
+                            "closing", talk["closing"], run_id, seconds_per_slide
+                        ),
+                        script=talk["closing"],
+                    )
+                finally:
+                    if subtitles is not None:
+                        subtitles.set()
             if final_question_seconds > 0.0:
                 self._speak_presentation_line(
                     f"presentation_final_qa:{run_id}",
@@ -4731,6 +5142,10 @@ class RealtimeBridge:
         poster_url = str(command.get("posterUrl", "")).strip()
         seconds_per_slide = float(command.get("secondsPerSlide", 30.0))
         talk = _normalise_talk(command.get("talk"))
+        # SlideWorkflow v1.72: the poster script carries no language yet;
+        # the previous talk's language must not leak into this one.
+        self.presentation_language = (talk or {}).get("language", "") or ""
+        self.presentation_subtitle_language = ""
         talk_source = str(command.get("talkSource", "poster"))
         catalog_route = str(command.get("catalogRoute", "direct"))
         question_seconds = float(command.get("questionSeconds", 5.0))
@@ -5151,6 +5566,9 @@ class RealtimeBridge:
             "format": fmt,
             "presentationTitle": entry["title"],
             "url": entry.get("url") or "",
+            "multiLangUrl": entry.get("multiLangUrl") or "",
+            "multiLangTracks": list(entry.get("multiLangTracks") or []),
+            "multiLangField": bool(entry.get("multiLangField", True)),
             "posterUrl": entry.get("posterUrl") or "",
             "secondsPerSlide": entry["secondsPerSlide"],
             "startSlide": entry["startSlide"],
@@ -6778,6 +7196,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input-device", default="")
     parser.add_argument("--vrchat-pid", type=int, default=0)
+    # Worlds whose Sliden shows one track of SlideWorkflow's stacked
+    # multi-language mp4 (each viewer picks the language on the world's panel).
+    parser.add_argument("--multilang-worlds", default=",".join(_MULTILANG_WORLD_IDS))
     parser.add_argument("--chunk-ms", type=int, default=20)
     parser.add_argument("--vad-threshold", type=float, default=0.5)
     parser.add_argument("--prefix-padding-ms", type=int, default=200)
